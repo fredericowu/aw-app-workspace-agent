@@ -380,6 +380,7 @@ def test_a_cached_cost_snapshot_skips_the_refetch_until_the_run_count_moves(inte
         tokens_in=7,
         tokens_out=3,
         cached_run_count=5,
+        derived_complete=True,
     )
 
     out = run(sessions.build_rail("http://ap", "tok", store))
@@ -393,6 +394,84 @@ def test_a_cached_cost_snapshot_skips_the_refetch_until_the_run_count_moves(inte
     out = run(sessions.build_rail("http://ap", "tok", store))
     assert out["backfilled"] == 1
     assert out["sessions"][0]["cost_usd"] == 1.5
+
+
+def test_skipping_the_refetch_needs_provenance_not_just_a_valid_cost_snapshot(intercept):
+    """REGRESSION, v0.3.1: this is what defeated the self-heal in the live app.
+
+    v0.3.1 made a complete view able to CORRECT a wrongly-derived bucket, but
+    the shortcut that skips refetching a session keyed only on the cost
+    snapshot still being valid. A session whose cost had not changed was
+    therefore never refetched, so the correction could never run — `planner
+    sonnet` stayed filed under Agents through a full rebuild. Skipping needs
+    BOTH halves of the cache to be trustworthy.
+    """
+    sess = {
+        "/api/sessions": [session_row("s1", run_count=5)],
+        "/api/runs": lambda req: (
+            [
+                run_row(
+                    f"r{i}",
+                    "s1",
+                    f"2026-11-14T1{i}:00:00+00:00",
+                    initiator_kind="telegram",
+                    source_device="telegram",
+                )
+                for i in range(5)
+            ]
+            if req.url.params.get("session_id")
+            else []
+        ),
+    }
+    store = FakeStore()
+    # A valid cost snapshot, but a bucket written from a partial view.
+    store.upsert_meta(
+        "s1",
+        agent_slug="x",
+        bucket="agent",
+        title="wrong",
+        first_run_at=1.0,
+        cost_usd=42.0,
+        cached_run_count=5,
+        last_run_at=0.0,
+    )
+
+    calls = intercept(sess)
+    out = run(sessions.build_rail("http://ap", "tok", store))
+    # It refetched despite the valid snapshot, and corrected the bucket.
+    assert out["backfilled"] == 1, calls
+    assert out["sessions"][0]["source"] == "user"
+    assert store.rows["s1"]["bucket"] == "user"
+    assert store.rows["s1"]["derived_complete"] is True
+
+    # Now that provenance is recorded, the shortcut resumes — the repair
+    # costs one refetch per session, not one per refresh.
+    calls.clear()
+    out = run(sessions.build_rail("http://ap", "tok", store))
+    assert out["backfilled"] == 0
+    assert len(calls) == 2, calls
+    assert not any("session_id=s1" in c for c in calls)
+    assert out["sessions"][0]["source"] == "user"
+
+
+def test_an_incomplete_view_never_downgrades_recorded_provenance(intercept):
+    """Otherwise the cheap refresh would clear the flag every 10s and the
+    rail would refetch everything forever."""
+    intercept({"/api/runs": [run_row("r1", "s1", "2026-11-14T17:00:00+00:00")]})
+    store = FakeStore()
+    store.upsert_meta(
+        "s1",
+        bucket="user",
+        title="t",
+        agent_slug="a",
+        first_run_at=1.0,
+        cached_run_count=1,
+        last_run_at=0.0,
+        derived_complete=True,
+    )
+    run(sessions.build_rail("http://ap", "tok", store, full=False))
+    assert store.rows["s1"]["derived_complete"] is True
+    assert store.rows["s1"]["bucket"] == "user"
 
 
 def test_the_cheap_refresh_never_writes_a_bucket_from_a_partial_view(intercept):

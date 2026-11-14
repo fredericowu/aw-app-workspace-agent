@@ -67,9 +67,29 @@ Unit tests passed throughout; only running the installed app against real
 data showed it.
 
 The rule is now about the *view*, not the ordering: an authoritative view may
-always correct, a partial one may never write. That also makes the fix
-self-healing — rows poisoned by v0.3.0 are corrected by the next full build,
-with no migration and no manual repair.
+always correct, a partial one may never write.
+
+**v0.3.1 shipped that rule and the repair still did not happen** — a second
+live check showed `planner sonnet` unchanged after a full rebuild. The
+shortcut that skips refetching a session keyed only on the *cost* snapshot
+still being valid, and that session's cost had not moved, so it was never
+refetched and the correction could never run. A valid cost snapshot says
+nothing about whether the bucket is valid.
+
+Hence `derived_complete`: provenance recording that the root-derived columns
+came from a view holding the root run. `build_rail` will not skip refetching
+a session until it is true, so the repair costs one refetch per affected
+session, once. That is what actually makes the fix self-healing — rows
+poisoned by v0.3.0/v0.3.1 are corrected by the next full build, no migration
+and no manual repair.
+
+One more thing had to be fixed for that column to exist at all: `ctx.db.create`
+is `CREATE TABLE IF NOT EXISTS` and the runtime never drops an app's tables
+(a version bump is uninstall+install, so dropping would wipe real data on
+every update). So on an upgrade the DDL is a no-op and a newly-added column
+simply does not exist, with every read of it coming back as if the feature
+had never shipped. `ensure_tables` now follows the creates with additive
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for every column.
 
 Two things ignore the flag on purpose: `created_from == "app"` always buckets
 as the user's (an app-local fact no run can report, and the initiator-kind
