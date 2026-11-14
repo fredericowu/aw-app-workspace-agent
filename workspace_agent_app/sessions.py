@@ -333,8 +333,17 @@ async def build_rail(base: str, token: str, store, full: bool = True) -> dict:
             meta = cached.get(sid) or {}
             if want and len(have) >= want:
                 plan[sid] = have  # covered — exact, free
-            elif meta.get("cached_run_count") == want and want:
-                plan[sid] = None  # cached snapshot still valid
+            elif meta.get("cached_run_count") == want and want and meta.get("derived_complete"):
+                # Skipping the fetch needs BOTH halves of the cache to be
+                # trustworthy, not just the cost snapshot. `derived_complete`
+                # is the second half: it records that the root-derived
+                # columns were written from a view that actually held the
+                # root run. Without that condition this shortcut silently
+                # defeated the repair path — a session whose cost snapshot
+                # was still valid was never refetched, so a bucket written
+                # from a partial view could never be corrected. That is why
+                # v0.3.1's self-heal did not fire on `planner sonnet`.
+                plan[sid] = None
             else:
                 needs_backfill.append(row)
 
@@ -523,6 +532,13 @@ def _persist(
         ):
             if derived.get(key) and meta.get(col) != derived[key]:
                 write[col] = derived[key]
+        # Provenance, not a value: records that the root-derived columns above
+        # came from a view holding the root run. build_rail reads it to decide
+        # whether it may skip refetching a session — a cost snapshot being
+        # valid says nothing about whether the bucket is. Only ever written
+        # True; an incomplete view must not downgrade a trustworthy row.
+        if not meta.get("derived_complete"):
+            write["derived_complete"] = True
     want = int(row.get("run_count") or 0)
     if meta.get("cached_run_count") != want:
         write.update(totals_, cached_run_count=want)

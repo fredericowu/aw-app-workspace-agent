@@ -10,22 +10,33 @@ requests has to be in the database. The tables ARE the cache.
 
 ``session_meta`` — one row per CLI session this app has seen.
 
-Two kinds of column live here, and the distinction is the whole point:
+Four kinds of column live here, and the distinctions are the whole point:
 
-* **Derive-once**: ``agent_slug``, ``bucket``, ``title``, ``origin``,
-  ``first_run_at``. These come from a session's FIRST run, which is
-  immutable, so they are computed once and never recomputed — that is what
-  keeps the rail off an N+1 per-session fetch.
+* **Root-derived**: ``agent_slug``, ``bucket``, ``title``, ``origin``,
+  ``first_run_at``. These come from a session's FIRST run, so they are only
+  valid when written from a view that actually held that run — see
+  ``sessions.derive``/``_persist`` and the ``complete`` flag. Caching them is
+  what keeps the rail off an N+1 per-session fetch.
+* **Provenance**: ``derived_complete``. Whether the columns above came from
+  such a view. ``sessions.build_rail`` refuses to skip refetching a session
+  until this is true, which is what makes a bad value repairable instead of
+  permanent.
 * **Snapshot**: ``cost_usd``, ``tokens_in``, ``tokens_out``, keyed on
-  ``cached_run_count``. A session's cost is NOT immutable (every new turn
-  adds to it), so these are only trusted while the session's upstream
-  ``run_count`` still matches the count they were computed at. The moment it
-  moves, the caller refetches. See sessions.build_rail.
+  ``cached_run_count``; plus ``name``/``retired_at``/``retired_reason``/
+  ``last_status``/``last_run_at`` mirrored from ``GET /api/sessions`` so the
+  cheap refresh can skip that call. A session's cost is NOT immutable (every
+  new turn adds to it), so the cost columns are trusted only while the
+  session's upstream ``run_count`` still matches the count they were
+  computed at.
 * **App-local state**: ``pinned`` / ``archived``. Neither exists upstream —
   ``CliSessionUpdate`` accepts only name/description, and ``retired_at`` is
   the executor's own death marker, not a user-facing archive. Rename, by
   contrast, is NOT here: it goes to the real ``PATCH /api/sessions/{id}`` so
   the name is shared with Telegram and every other consumer.
+
+A cost snapshot being valid says nothing about whether the root-derived
+columns are, which is why those two groups are tracked separately rather
+than behind one "is this row fresh" flag.
 
 ``app_dispatch`` — one row per run THIS app dispatched, so a session the user
 started here can be bucketed as "User" rather than falling through the
@@ -62,7 +73,8 @@ _SESSION_META_COLUMNS = """
     retired_at        TEXT,
     retired_reason    TEXT,
     last_status       TEXT,
-    last_run_at       DOUBLE PRECISION
+    last_run_at       DOUBLE PRECISION,
+    derived_complete  BOOLEAN NOT NULL DEFAULT FALSE
 """
 
 _APP_DISPATCH_COLUMNS = """
@@ -91,6 +103,9 @@ _META_FIELDS = (
     "retired_reason",
     "last_status",
     "last_run_at",
+    # Provenance for the root-derived columns above — see sessions._persist.
+    # build_rail will not skip refetching a session until this is true.
+    "derived_complete",
 )
 
 
@@ -105,10 +120,38 @@ class Store:
         self.db = db
 
     def ensure_tables(self) -> None:
+        """Create both tables, then bring an already-created one up to the
+        current column list.
+
+        The second half is load-bearing, not belt-and-braces. ``ctx.db.create``
+        is ``CREATE TABLE IF NOT EXISTS``, and the runtime deliberately never
+        drops an app's tables (a plain version bump is uninstall+install, so
+        dropping would wipe real data on every routine update). So on an
+        UPGRADE the DDL above is a no-op and a column added in this release
+        would simply not exist — every read of it returning as if the feature
+        had never shipped. ``derived_complete`` hit exactly that on the
+        v0.3.1 -> v0.3.2 upgrade.
+
+        Additive ``ADD COLUMN IF NOT EXISTS`` rather than a ``migrations/``
+        file because these tables are a cache this app wholly owns: the
+        statements are idempotent, they run on every activate, and there is
+        no ordering or data-rewriting step for a migration to express.
+        Anything that is NOT purely additive (a type change, a backfill, a
+        drop) does belong in ``migrations/``.
+        """
         if self.db is None:
             return
         self.db.create(SESSION_META, _SESSION_META_COLUMNS)
         self.db.create(APP_DISPATCH, _APP_DISPATCH_COLUMNS)
+        for name, columns_sql in (
+            (SESSION_META, _SESSION_META_COLUMNS),
+            (APP_DISPATCH, _APP_DISPATCH_COLUMNS),
+        ):
+            for line in columns_sql.strip().splitlines():
+                col = line.strip().rstrip(",")
+                if not col or "PRIMARY KEY" in col:
+                    continue
+                self.db.execute(name, f"ALTER TABLE {{table}} ADD COLUMN IF NOT EXISTS {col}")
 
     # ---- session_meta -------------------------------------------------
 

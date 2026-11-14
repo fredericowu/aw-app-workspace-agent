@@ -70,6 +70,31 @@ def test_ensure_tables_creates_both():
     assert "run_id      TEXT PRIMARY KEY" in cols[APP_DISPATCH]
 
 
+def test_ensure_tables_adds_columns_to_an_already_created_table():
+    """REGRESSION, v0.3.1 -> v0.3.2. ctx.db.create is CREATE TABLE IF NOT
+    EXISTS and the runtime never drops an app's tables (a version bump is
+    uninstall+install, so dropping would wipe real data on every update). So
+    on an UPGRADE the create is a no-op, and a column added in the new
+    release would simply not exist — every read of it coming back as if the
+    feature had never shipped. `derived_complete` hit exactly that, which is
+    why the self-heal did not fire in the live app."""
+    db = FakeDb()
+    Store(db).ensure_tables()
+    alters = [sql for name, sql, _ in db.calls if sql.startswith("ALTER TABLE")]
+
+    # Every non-PK column is covered, idempotently.
+    assert any("ADD COLUMN IF NOT EXISTS derived_complete" in a for a in alters)
+    assert any("ADD COLUMN IF NOT EXISTS cached_run_count" in a for a in alters)
+    assert any("ADD COLUMN IF NOT EXISTS session_id" in a for a in alters)  # app_dispatch's
+    assert all("IF NOT EXISTS" in a for a in alters)
+
+    # A primary key cannot be added this way, so those lines are skipped.
+    assert not any("PRIMARY KEY" in a for a in alters)
+
+    covered = {a.split("ADD COLUMN IF NOT EXISTS ")[1].split()[0] for a in alters}
+    assert set(store_mod._META_FIELDS) <= covered
+
+
 def test_all_meta_maps_rows_onto_column_names():
     row = (
         "s1",
