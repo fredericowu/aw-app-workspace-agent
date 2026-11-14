@@ -2,8 +2,8 @@
   "manifest_version": 1,
   "id": "workspace-agent",
   "name": "Workspace Agent",
-  "version": "0.1.0",
-  "description": "Browse every agent this workspace can dispatch, see who is running right now, and open sessions without leaving the workspace — a command-center view over your Agents Platform fleet.",
+  "version": "0.2.0",
+  "description": "Browse every agent this workspace can dispatch, see who is running right now, and open sessions without leaving the workspace \u2014 a command-center view over your Agents Platform fleet.",
   "tier": "inprocess",
   "requires_ui_refresh": true,
   "publisher": "TekFlox",
@@ -48,7 +48,7 @@
       {
         "id": "aw-create-app",
         "path": "skills/aw-create-app/SKILL.md",
-        "description": "How to author a decoupled aw-workspace app from this template — manifest, tiers, capabilities, contributes, backend routes (HTTP+WS), frontend code, standalone mode, window widgets, install + marketplace release."
+        "description": "How to author a decoupled aw-workspace app from this template \u2014 manifest, tiers, capabilities, contributes, backend routes (HTTP+WS), frontend code, standalone mode, window widgets, install + marketplace release."
       }
     ],
     "knowledge": {
@@ -60,12 +60,12 @@
     "properties": {
       "agents_platform_base": {
         "type": "string",
-        "description": "Agents Platform REST base URL, e.g. http://172.18.0.1:10014. Leave empty to inherit the Agents Platform Runners app's own config at $AW_WORKSPACE_HOME/app-config/agents-platform-runners.json — set this only to point at a different platform or as a break-glass override."
+        "description": "Agents Platform REST base URL, e.g. http://172.18.0.1:10014. Leave empty to inherit the Agents Platform Runners app's own config at $AW_WORKSPACE_HOME/app-config/agents-platform-runners.json \u2014 set this only to point at a different platform or as a break-glass override."
       },
       "agents_platform_token": {
         "type": "string",
         "x-secret": true,
-        "description": "Bearer token for the Agents Platform REST API. Leave empty to inherit the Agents Platform Runners app's own token. Never sent to the browser — the app backend holds it and proxies every call."
+        "description": "Bearer token for the Agents Platform REST API. Leave empty to inherit the Agents Platform Runners app's own token. Never sent to the browser \u2014 the app backend holds it and proxies every call."
       }
     },
     "required": []
