@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "id": "workspace-agent",
   "name": "Workspace Agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Browse every agent this workspace can dispatch, see who is running right now, and open sessions without leaving the workspace \u2014 a command-center view over your Agents Platform fleet.",
   "tier": "inprocess",
   "requires_ui_refresh": true,
