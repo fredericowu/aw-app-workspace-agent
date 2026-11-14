@@ -395,7 +395,99 @@ def test_a_cached_cost_snapshot_skips_the_refetch_until_the_run_count_moves(inte
     assert out["sessions"][0]["cost_usd"] == 1.5
 
 
-def test_rail_persists_derive_once_columns_and_never_rewrites_them(intercept):
+def test_the_cheap_refresh_never_writes_a_bucket_from_a_partial_view(intercept):
+    """REGRESSION, caught live on 2026-11-14 in the installed app.
+
+    The sweep is the newest 1000 runs PLATFORM-WIDE, so for a long-running
+    session it holds only recent runs — runs[0] is then a mid-session
+    `wakeup`, not the `telegram` root. A 486-run Telegram session was
+    bucketed Agents because the first request after install took this path
+    on a cold cache, and "derive once, never recompute" made it permanent.
+    """
+    intercept(
+        {
+            "/api/runs": [
+                # What the sweep can see of a long session: no root run in sight.
+                run_row("r485", "planner", "2026-11-14T15:00:00+00:00", initiator_kind="wakeup"),
+                run_row("r486", "planner", "2026-11-14T16:00:00+00:00", initiator_kind="wakeup"),
+            ]
+        }
+    )
+    store = FakeStore()
+    out = run(sessions.build_rail("http://ap", "tok", store, full=False))
+
+    # It still renders — AC3 needs new sessions to appear from the sweep.
+    assert out["sessions"][0]["id"] == "planner"
+    # ...but nothing root-derived was persisted, so the full build is free to
+    # write the truth rather than being locked out by a wrong "derive-once".
+    for col in ("bucket", "agent_slug", "title", "first_run_at"):
+        assert col not in store.rows["planner"], col
+    # The snapshot columns ARE written — they are deltas, not root-derived.
+    assert store.rows["planner"]["cached_run_count"] == 2
+    assert store.rows["planner"]["cost_usd"] == 3.0
+
+
+def test_a_complete_view_corrects_a_bucket_an_earlier_partial_one_got_wrong(intercept):
+    """The other half of the fix: self-healing. A row poisoned before this
+    fix shipped must be corrected by the next full build — no migration, no
+    manual repair."""
+    intercept(
+        {
+            "/api/sessions": [session_row("planner", run_count=2)],
+            "/api/runs": lambda req: [
+                run_row(
+                    "r1",
+                    "planner",
+                    "2026-11-14T14:00:00+00:00",
+                    initiator_kind="telegram",
+                    source_device="telegram",
+                    source_slug="telegram-sonnet-aw",
+                ),
+                run_row(
+                    "r2",
+                    "planner",
+                    "2026-11-14T16:00:00+00:00",
+                    initiator_kind="wakeup",
+                    source_slug="telegram-sonnet-aw",
+                ),
+            ],
+        }
+    )
+    store = FakeStore()
+    store.upsert_meta(
+        "planner",
+        bucket="agent",
+        title="wrong",
+        agent_slug="x",
+        first_run_at=999.0,
+        cached_run_count=2,
+        last_run_at=0.0,
+    )
+
+    out = run(sessions.build_rail("http://ap", "tok", store))
+    assert store.rows["planner"]["bucket"] == "user"
+    assert out["sessions"][0]["source"] == "user"
+    assert store.rows["planner"]["agent_slug"] == "telegram-sonnet-aw"
+
+
+def test_an_incomplete_backfill_still_does_not_write_derive_once(intercept):
+    """A session with more runs than the fetch ceiling never yields its root,
+    so even the FULL build must not write root-derived columns for it."""
+    intercept(
+        {
+            "/api/sessions": [session_row("huge", run_count=5000)],
+            "/api/runs": lambda req: [
+                run_row("r1", "huge", "2026-11-14T16:00:00+00:00", initiator_kind="wakeup")
+            ],
+        }
+    )
+    store = FakeStore()
+    run(sessions.build_rail("http://ap", "tok", store))
+    assert "bucket" not in store.rows["huge"]
+    assert store.rows["huge"]["name"] == ""  # the mirror still lands
+
+
+def test_rail_persists_root_derived_columns_from_a_complete_view(intercept):
     intercept(
         {
             "/api/sessions": [session_row("s1", run_count=1)],
@@ -406,14 +498,76 @@ def test_rail_persists_derive_once_columns_and_never_rewrites_them(intercept):
     run(sessions.build_rail("http://ap", "tok", store))
     assert store.rows["s1"]["agent_slug"] == "architect"
     assert store.rows["s1"]["title"] == "hello there"
+    assert store.rows["s1"]["bucket"] == "agent"
     assert store.rows["s1"]["cached_run_count"] == 1
 
-    # A later pass where the newest run is a different agent must not rewrite
-    # the derive-once columns: the session's first run is immutable, and
-    # re-deriving a title from a partial view is how titles start drifting.
-    store.rows["s1"]["title"] = "pinned title"
-    run(sessions.build_rail("http://ap", "tok", store))
-    assert store.rows["s1"]["title"] == "pinned title"
+
+def test_only_a_complete_view_may_write_a_root_derived_column(intercept):
+    """The invariant, stated once.
+
+    This replaces an earlier "derive once, never rewrite" rule, which was
+    wrong in the direction that matters: it let the FIRST view win even when
+    that view could not see the root run, and then locked the mistake in
+    permanently. The real rule is about the view, not the ordering — an
+    authoritative view may always correct; a partial one may never write.
+    """
+    sweep_only = [
+        run_row(
+            "r9",
+            "s1",
+            "2026-11-14T16:00:00+00:00",
+            initiator_kind="wakeup",
+            source_slug="qa-sonnet",
+        )
+    ]
+    store = FakeStore()
+    store.upsert_meta(
+        "s1",
+        bucket="user",
+        title="the real first prompt",
+        agent_slug="telegram-sonnet-aw",
+        first_run_at=100.0,
+        cached_run_count=50,
+        last_run_at=0.0,
+    )
+
+    # Partial view (run_count says 50, we can see 1): must not touch them.
+    intercept(
+        {"/api/sessions": [session_row("s1", run_count=50)], "/api/runs": lambda req: sweep_only}
+    )
+    out = run(sessions.build_rail("http://ap", "tok", store))
+    assert store.rows["s1"]["bucket"] == "user"
+    assert store.rows["s1"]["title"] == "the real first prompt"
+    assert store.rows["s1"]["first_run_at"] == 100.0
+    assert out["sessions"][0]["source"] == "user"
+
+    # Complete view (run_count now matches what we can see): may correct.
+    intercept(
+        {"/api/sessions": [session_row("s1", run_count=1)], "/api/runs": lambda req: sweep_only}
+    )
+    out = run(sessions.build_rail("http://ap", "tok", store))
+    assert store.rows["s1"]["bucket"] == "agent"
+    assert store.rows["s1"]["title"] == "hello there"
+    assert out["sessions"][0]["source"] == "agent"
+
+
+def test_an_app_started_session_stays_the_users_whatever_its_runs_say(intercept):
+    """created_from is an app-local fact no run can report, and the
+    initiator-kind heuristic cannot tell an app dispatch from any other API
+    dispatch — so it must survive even a complete, authoritative view."""
+    intercept(
+        {
+            "/api/sessions": [session_row("s1", run_count=1)],
+            "/api/runs": [
+                run_row("r1", "s1", "2026-11-14T16:00:00+00:00", initiator_kind="agent_run")
+            ],
+        }
+    )
+    store = FakeStore()
+    store.upsert_meta("s1", created_from="app", bucket="user")
+    out = run(sessions.build_rail("http://ap", "tok", store))
+    assert out["sessions"][0]["source"] == "user"
+    assert store.rows["s1"]["bucket"] == "user"
 
 
 def test_one_sessions_backfill_failing_does_not_fail_the_rail(intercept):
