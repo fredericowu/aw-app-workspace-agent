@@ -9,6 +9,12 @@ environment since there is no workspace config store here.
 
 No ``IdentityGuard`` — that is aw-workspace runtime machinery, not app code.
 Default posture: bind ``127.0.0.1`` only.
+
+No workspace database either, so ``build_routes`` gets no ``Store`` and the
+Sessions surface runs without its app-local columns: pin and archive do not
+persist and every rail entry is derived fresh. Everything that comes from
+the platform — the rail itself, threads, dispatch, streaming, cost — works
+exactly as it does integrated. See store.py's ``Store`` docstring.
 """
 
 from __future__ import annotations

@@ -203,6 +203,9 @@
                   </div>
                 </div>
                 <div class="thread-actions">
+                  <button class="icon-btn" id="threadRename" aria-label="Rename session" title="Rename — shared with every other consumer of this session">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19.5 8.5a2.1 2.1 0 0 0-3-3L5 17v3z"/><path d="M14.5 5.5l4 4"/></svg>
+                  </button>
                   <button class="icon-btn" id="threadPin" aria-label="Pin session" title="Pin to the top of the list">★</button>
                   <button class="icon-btn" id="threadArchive" aria-label="Archive session" title="Archive">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="4.5" rx="1.5"/><path d="M5 8.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19V8.5"/><path d="M10 12h4"/></svg>
@@ -281,6 +284,30 @@
   </aside>
 
   <!-- ───────────────────────── gallery picker ───────────────────────── -->
+  <!-- Rename goes through the platform's own PATCH /api/sessions/{id}, so the
+       name is shared with Telegram and every other consumer. In-DOM overlay
+       rather than window.prompt: this window is an iframe, where the native
+       dialogs are not available. -->
+  <div class="modal" id="renamer" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Rename session">
+    <div class="modal-card">
+      <header class="modal-head">
+        <div>
+          <h2>Rename this session</h2>
+          <p>The name is stored on the session itself, so Telegram and every other
+             consumer sees it too. Clear it to go back to the derived title.</p>
+        </div>
+        <button class="icon-btn icon-btn--lg" id="renamerClose" aria-label="Close">✕</button>
+      </header>
+      <div class="field field--sm" style="margin:16px 18px">
+        <input id="renamerInput" type="text" placeholder="Session name" aria-label="Session name" autocomplete="off" />
+      </div>
+      <footer class="modal-foot" style="display:flex;justify-content:flex-end;gap:8px">
+        <button class="btn btn--ghost" id="renamerCancel">Cancel</button>
+        <button class="btn btn--primary" id="renamerSave">Save name</button>
+      </footer>
+    </div>
+  </div>
+
   <div class="modal" id="picker" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Choose an agent">
     <div class="modal-card modal-card--wide">
       <header class="modal-head">

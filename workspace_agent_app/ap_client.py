@@ -109,20 +109,134 @@ class APError(RuntimeError):
     """Raised when the Agents Platform is unreachable or unauthorized."""
 
 
+def _auth(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _url(base: str, path: str) -> str:
+    return f"{base.rstrip('/')}{path}"
+
+
+def _check(resp: httpx.Response) -> None:
+    """Translate the two failures the UI has to tell apart — a bad token and
+    everything else — then let httpx raise for the rest."""
+    if resp.status_code == 401:
+        raise APError("platform token invalid or expired")
+    resp.raise_for_status()
+
+
 async def _get(client: httpx.AsyncClient, base: str, token: str, path: str, **params) -> Any:
     try:
         resp = await client.get(
-            f"{base.rstrip('/')}{path}",
-            headers={"Authorization": f"Bearer {token}"},
+            _url(base, path),
+            headers=_auth(token),
             params=params,
             timeout=15.0,
         )
     except httpx.HTTPError as exc:
         raise APError(f"could not reach the Agents Platform: {exc}") from exc
-    if resp.status_code == 401:
-        raise APError("platform token invalid or expired")
-    resp.raise_for_status()
+    _check(resp)
     return resp.json()
+
+
+#: Public name for the same call — sessions.py is a separate module and
+#: should not be reaching into an underscore.
+get_json = _get
+
+
+async def _write(
+    client: httpx.AsyncClient, method: str, base: str, token: str, path: str, body: dict
+) -> Any:
+    try:
+        resp = await client.request(
+            method,
+            _url(base, path),
+            headers=_auth(token),
+            json=body,
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        raise APError(f"could not reach the Agents Platform: {exc}") from exc
+    if resp.status_code in (400, 404, 409, 429):
+        # The platform's own refusals carry a reason the user needs to read
+        # verbatim: an unknown agent slug (404), a QA dedup or budget
+        # refusal (409/429), a rejected dispatch (400). Collapsing them into
+        # a bare 502 "upstream error" throws away the only useful part.
+        detail = ""
+        try:
+            detail = str((resp.json() or {}).get("detail") or "")
+        except ValueError:
+            detail = resp.text[:400]
+        raise APError(detail or f"the platform refused the request ({resp.status_code})")
+    _check(resp)
+    return resp.json()
+
+
+async def post_json(client: httpx.AsyncClient, base: str, token: str, path: str, body: dict) -> Any:
+    return await _write(client, "POST", base, token, path, body)
+
+
+async def patch_json(
+    client: httpx.AsyncClient, base: str, token: str, path: str, body: dict
+) -> Any:
+    return await _write(client, "PATCH", base, token, path, body)
+
+
+async def stream_sse(base: str, token: str, path: str):
+    """Byte-for-byte passthrough of an upstream SSE response.
+
+    Three things make this a stream rather than a buffered fetch:
+
+    * ``read=None`` — an agent run can go minutes between events (a cold
+      container, a long tool call), and any finite read timeout would kill a
+      perfectly healthy turn.
+    * ``aiter_bytes`` — yields the frames as the platform wrote them, with
+      any transfer encoding already undone. NOT ``aiter_raw``: httpx offers
+      ``Accept-Encoding: gzip`` by default, and raw bytes would then be
+      compressed bytes forwarded under a ``text/event-stream`` header this
+      route sets itself, with no ``Content-Encoding`` to tell the browser.
+    * the client is created here and closed in the ``finally``, not with
+      ``async with`` around the call — the generator outlives this function's
+      first ``yield``, so a context manager scoped to the call would close
+      the socket out from under it.
+
+    Nothing clever happens on reconnect, on purpose: the upstream route
+    replays every persisted event from the DB on each connect and closes a
+    finished run with a ``done`` event (api/runs.py's ``stream_run``), so a
+    dropped stream recovers losslessly through ``EventSource``'s native
+    auto-reconnect.
+    """
+    client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=15.0, read=None, write=15.0, pool=15.0)
+    )
+    try:
+        async with client.stream("GET", _url(base, path), headers=_auth(token)) as resp:
+            if resp.status_code != 200:
+                await resp.aread()
+                reason = (
+                    "platform token invalid or expired"
+                    if resp.status_code == 401
+                    else f"upstream stream returned {resp.status_code}"
+                )
+                yield _sse_error(reason)
+                return
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+    except httpx.HTTPError as exc:
+        # The client is already streaming, so an HTTP status is no longer
+        # available to it — report the failure as a frame it can render
+        # instead of just dropping the connection.
+        yield _sse_error(f"stream to the Agents Platform failed: {exc}")
+    finally:
+        await client.aclose()
+
+
+def _sse_error(reason: str) -> bytes:
+    import json as _json
+
+    return (
+        b"event: error\ndata: " + _json.dumps({"kind": "error", "error": reason}).encode() + b"\n\n"
+    )
 
 
 def _agent_squad(agent: dict) -> str:
@@ -192,8 +306,25 @@ def shape_bootstrap(agents: list[dict], groups: list[dict], runs: list[dict]) ->
     }
 
 
+#: Model providers that run through a coding CLI, and therefore MINT a CLI
+#: session the platform records as a ``CliSession``. Everything else answers
+#: over a plain API call and leaves no session behind, so a run against it
+#: can never be resumed — measured on this workspace: 84 of 92 live agents
+#: are ``runner``, the other 8 are openai/echo/fake/anthropic. The Fleet
+#: gallery offers all of them, so the Sessions surface has to say which is
+#: which rather than letting a tab silently become un-continuable.
+RESUMABLE_PROVIDERS = frozenset({"runner", "cli"})
+
+
 def shape_models(models: list[dict]) -> dict:
-    return {m["slug"]: {"label": m.get("display_name") or m["slug"]} for m in models}
+    return {
+        m["slug"]: {
+            "label": m.get("display_name") or m["slug"],
+            "provider": m.get("provider") or "",
+            "resumable": (m.get("provider") or "") in RESUMABLE_PROVIDERS,
+        }
+        for m in models
+    }
 
 
 # A tiny, deliberately small icon->glyph map — just enough common icons to

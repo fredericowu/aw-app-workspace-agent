@@ -228,6 +228,48 @@ def test_shape_bootstrap_no_ungrouped_bucket_when_every_agent_has_a_real_group()
 
 def test_shape_models_keys_by_slug():
     models = ap_client.shape_models(
-        [{"slug": "anthropic-sonnet-4-5", "display_name": "Claude Sonnet 4.5"}]
+        [
+            {
+                "slug": "anthropic-sonnet-4-5",
+                "display_name": "Claude Sonnet 4.5",
+                "provider": "runner",
+            }
+        ]
     )
-    assert models == {"anthropic-sonnet-4-5": {"label": "Claude Sonnet 4.5"}}
+    assert models == {
+        "anthropic-sonnet-4-5": {
+            "label": "Claude Sonnet 4.5",
+            "provider": "runner",
+            "resumable": True,
+        }
+    }
+
+
+def test_shape_models_marks_which_providers_leave_a_resumable_session():
+    """Only a coding-CLI model mints a CliSession, and a CliSession is the
+    only kind of session this app shows — so an agent on a plain API model
+    answers once and leaves nothing to resume. The Fleet gallery offers all
+    of them, so the UI has to be able to tell the difference BEFORE the user
+    has spent a run finding out."""
+    models = ap_client.shape_models(
+        [
+            {"slug": "claude-runner-sonnet", "provider": "runner"},
+            {"slug": "some-cli", "provider": "cli"},
+            {"slug": "openai-o4-mini", "provider": "openai"},
+            {"slug": "echo", "provider": "echo"},
+            {"slug": "direct-anthropic", "provider": "anthropic"},
+            {"slug": "no-provider-field"},
+        ]
+    )
+    assert {k: v["resumable"] for k, v in models.items()} == {
+        "claude-runner-sonnet": True,
+        "some-cli": True,
+        "openai-o4-mini": False,
+        "echo": False,
+        # Calling the vendor API directly is NOT a CLI session, however
+        # capable the model is — the distinction is the transport.
+        "direct-anthropic": False,
+        "no-provider-field": False,
+    }
+    # The label still falls back to the slug, as before.
+    assert models["echo"]["label"] == "echo"

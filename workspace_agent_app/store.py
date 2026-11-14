@@ -1,0 +1,196 @@
+"""App-local state for the Sessions surface — two workspace tables behind
+``ctx.db`` (capability ``db:own-tables``, so every name carries the enforced
+``app__workspace-agent__`` prefix).
+
+Why a table and not a dict: the workspace runs N uvicorn worker processes
+(``AW_WORKSPACE_WORKERS``), and nothing routes a given browser to a given
+worker. A dispatch recorded in one worker's memory is invisible to the
+worker that later polls the run, so every fact the UI depends on across two
+requests has to be in the database. The tables ARE the cache.
+
+``session_meta`` — one row per CLI session this app has seen.
+
+Two kinds of column live here, and the distinction is the whole point:
+
+* **Derive-once**: ``agent_slug``, ``bucket``, ``title``, ``origin``,
+  ``first_run_at``. These come from a session's FIRST run, which is
+  immutable, so they are computed once and never recomputed — that is what
+  keeps the rail off an N+1 per-session fetch.
+* **Snapshot**: ``cost_usd``, ``tokens_in``, ``tokens_out``, keyed on
+  ``cached_run_count``. A session's cost is NOT immutable (every new turn
+  adds to it), so these are only trusted while the session's upstream
+  ``run_count`` still matches the count they were computed at. The moment it
+  moves, the caller refetches. See sessions.build_rail.
+* **App-local state**: ``pinned`` / ``archived``. Neither exists upstream —
+  ``CliSessionUpdate`` accepts only name/description, and ``retired_at`` is
+  the executor's own death marker, not a user-facing archive. Rename, by
+  contrast, is NOT here: it goes to the real ``PATCH /api/sessions/{id}`` so
+  the name is shared with Telegram and every other consumer.
+
+``app_dispatch`` — one row per run THIS app dispatched, so a session the user
+started here can be bucketed as "User" rather than falling through the
+initiator-kind heuristic to "Agents". ``session_id`` starts NULL (the CLI
+mints it, the platform persists it on the run row some seconds later) and is
+backfilled by the run poll.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+log = logging.getLogger("aw_apps.workspace_agent.store")
+
+SESSION_META = "app__workspace-agent__session_meta"
+APP_DISPATCH = "app__workspace-agent__app_dispatch"
+
+_SESSION_META_COLUMNS = """
+    session_id        TEXT PRIMARY KEY,
+    agent_slug        TEXT,
+    bucket            TEXT,
+    title             TEXT,
+    origin            TEXT,
+    created_from      TEXT,
+    first_run_at      DOUBLE PRECISION,
+    pinned            BOOLEAN NOT NULL DEFAULT FALSE,
+    archived          BOOLEAN NOT NULL DEFAULT FALSE,
+    cost_usd          DOUBLE PRECISION,
+    tokens_in         BIGINT,
+    tokens_out        BIGINT,
+    cached_run_count  INTEGER,
+    name              TEXT,
+    retired_at        TEXT,
+    retired_reason    TEXT,
+    last_status       TEXT,
+    last_run_at       DOUBLE PRECISION
+"""
+
+_APP_DISPATCH_COLUMNS = """
+    run_id      TEXT PRIMARY KEY,
+    agent_slug  TEXT NOT NULL,
+    session_id  TEXT
+"""
+
+_META_FIELDS = (
+    "agent_slug",
+    "bucket",
+    "title",
+    "origin",
+    "created_from",
+    "first_run_at",
+    "pinned",
+    "archived",
+    "cost_usd",
+    "tokens_in",
+    "tokens_out",
+    "cached_run_count",
+    # Snapshot of what only GET /api/sessions can tell us, so the ~10s
+    # refresh can skip that call entirely — see sessions.build_rail_fast.
+    "name",
+    "retired_at",
+    "retired_reason",
+    "last_status",
+    "last_run_at",
+)
+
+
+class Store:
+    """Thin wrapper over ``ctx.db``. Every method is a no-op returning empty
+    when ``db`` is None — that is the standalone/dev mode (``__main__.py``),
+    where there is no workspace database to talk to. The Sessions surface
+    degrades to "nothing pinned, nothing archived, derive every time" rather
+    than failing, which is exactly what a dev run wants."""
+
+    def __init__(self, db: Any | None) -> None:
+        self.db = db
+
+    def ensure_tables(self) -> None:
+        if self.db is None:
+            return
+        self.db.create(SESSION_META, _SESSION_META_COLUMNS)
+        self.db.create(APP_DISPATCH, _APP_DISPATCH_COLUMNS)
+
+    # ---- session_meta -------------------------------------------------
+
+    def all_meta(self) -> dict[str, dict]:
+        """Every known session's meta row, keyed by session_id."""
+        if self.db is None:
+            return {}
+        cols = ", ".join(("session_id",) + _META_FIELDS)
+        rows = self.db.execute(SESSION_META, f"SELECT {cols} FROM {{table}}")
+        return {r[0]: dict(zip(_META_FIELDS, r[1:])) for r in rows}
+
+    def meta(self, session_id: str) -> dict | None:
+        return self.all_meta().get(session_id)
+
+    def upsert_meta(self, session_id: str, **fields) -> None:
+        """Insert or update only the columns named in ``fields``.
+
+        ``ON CONFLICT DO UPDATE`` rather than a read-modify-write: two
+        workers can be building the rail at the same moment, and an upsert
+        makes that a last-writer-wins on identical derived values instead of
+        a lost row.
+        """
+        if self.db is None or not fields:
+            return
+        bad = set(fields) - set(_META_FIELDS)
+        if bad:
+            raise ValueError(f"unknown session_meta column(s): {sorted(bad)}")
+        names = list(fields)
+        cols = ", ".join(["session_id"] + names)
+        placeholders = ", ".join([":session_id"] + [f":{n}" for n in names])
+        updates = ", ".join(f"{n} = EXCLUDED.{n}" for n in names)
+        self.db.execute(
+            SESSION_META,
+            f"INSERT INTO {{table}} ({cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT (session_id) DO UPDATE SET {updates}",
+            {"session_id": session_id, **fields},
+        )
+
+    def set_flag(self, session_id: str, column: str, value: bool) -> bool:
+        """Toggle ``pinned``/``archived``. Creates the row if the user pins a
+        session the rail has not derived yet."""
+        if column not in ("pinned", "archived"):
+            raise ValueError(f"not a toggleable column: {column!r}")
+        self.upsert_meta(session_id, **{column: value})
+        return value
+
+    # ---- app_dispatch -------------------------------------------------
+
+    def record_dispatch(self, run_id: str, agent_slug: str) -> None:
+        if self.db is None:
+            return
+        self.db.execute(
+            APP_DISPATCH,
+            "INSERT INTO {table} (run_id, agent_slug) VALUES (:run_id, :agent_slug) "
+            "ON CONFLICT (run_id) DO NOTHING",
+            {"run_id": run_id, "agent_slug": agent_slug},
+        )
+
+    def dispatch(self, run_id: str) -> dict | None:
+        if self.db is None:
+            return None
+        rows = self.db.execute(
+            APP_DISPATCH,
+            "SELECT run_id, agent_slug, session_id FROM {table} WHERE run_id = :run_id",
+            {"run_id": run_id},
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {"run_id": r[0], "agent_slug": r[1], "session_id": r[2]}
+
+    def resolve_dispatch(self, run_id: str, session_id: str) -> None:
+        """A run this app dispatched has been given its session id. Record it
+        on both tables: ``app_dispatch`` so a re-poll is idempotent, and
+        ``session_meta`` so the rail buckets this session as the user's own
+        rather than running it through the initiator-kind heuristic (which
+        cannot tell an app-started session from any other API dispatch)."""
+        if self.db is None:
+            return
+        self.db.execute(
+            APP_DISPATCH,
+            "UPDATE {table} SET session_id = :session_id WHERE run_id = :run_id",
+            {"run_id": run_id, "session_id": session_id},
+        )
+        self.upsert_meta(session_id, bucket="user", created_from="app")
