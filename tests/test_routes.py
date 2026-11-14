@@ -1,12 +1,11 @@
-"""TestClient coverage for template_app/routes.py's build_routes() (ADR
-Decision 6 item 6, docs/knowledge_base/docs/architecture/
-adr-app-front-back-routes-dual-mode.md).
+"""TestClient coverage for workspace_agent_app/routes.py's build_routes().
 
-TEMPLATE: this is the pattern every aw-app-* backend-routes app uses — build
-the sub-app fresh per test (build_routes() must be call-idempotent), assert
-HTTP + WS against it directly, no framework runtime needed.
+ap_client.fetch_bootstrap/fetch_pulse are monkeypatched here — their own
+real-field-mapping logic is covered by test_ap_client.py; this file only
+proves the HTTP surface (503 when unconfigured, 200/502 passthrough, and
+that the frontend is served at the sub-app's own root).
 
-Run: .venv/aw/bin/python -m pytest tests/test_routes.py
+Run: python -m pytest tests/test_routes.py -q
 """
 
 from __future__ import annotations
@@ -19,70 +18,74 @@ from fastapi.testclient import TestClient
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from template_app.routes import build_routes  # noqa: E402
+from workspace_agent_app import ap_client  # noqa: E402
+from workspace_agent_app.routes import build_routes  # noqa: E402
 
 
-def test_template():
-    client = TestClient(build_routes())
-    resp = client.get("/template")
+def test_bootstrap_503s_when_no_credentials_are_configured():
+    client = TestClient(build_routes(lambda: ("", "")))
+    resp = client.get("/api/bootstrap")
+    assert resp.status_code == 503
+
+
+def test_bootstrap_returns_the_shaped_payload_when_configured(monkeypatch):
+    async def fake_fetch_bootstrap(base, token):
+        assert (base, token) == ("http://ap", "tok")
+        return {"agents": [], "squads": [], "models": {}, "stats": {"agents": 0}}
+
+    monkeypatch.setattr(ap_client, "fetch_bootstrap", fake_fetch_bootstrap)
+    client = TestClient(build_routes(lambda: ("http://ap", "tok")))
+    resp = client.get("/api/bootstrap")
     assert resp.status_code == 200
-    assert resp.json() == {"message": "Hello from the aw-app-template sub-app"}
+    assert resp.json()["stats"] == {"agents": 0}
 
 
-def test_ws_echo_sends_aw_ws_1_init_frame_first():
+def test_bootstrap_surfaces_a_platform_error_as_502(monkeypatch):
+    async def raising(base, token):
+        raise ap_client.APError("platform token invalid or expired")
+
+    monkeypatch.setattr(ap_client, "fetch_bootstrap", raising)
+    client = TestClient(build_routes(lambda: ("http://ap", "bad-tok")))
+    resp = client.get("/api/bootstrap")
+    assert resp.status_code == 502
+    assert "invalid" in resp.json()["detail"]
+
+
+def test_pulse_503s_when_no_credentials_are_configured():
+    client = TestClient(build_routes(lambda: ("", "")))
+    resp = client.get("/api/pulse")
+    assert resp.status_code == 503
+
+
+def test_pulse_surfaces_a_platform_error_as_502(monkeypatch):
+    async def raising(base, token):
+        raise ap_client.APError("could not reach the Agents Platform: boom")
+
+    monkeypatch.setattr(ap_client, "fetch_pulse", raising)
+    client = TestClient(build_routes(lambda: ("http://ap", "tok")))
+    resp = client.get("/api/pulse")
+    assert resp.status_code == 502
+
+
+def test_pulse_returns_the_shaped_payload_when_configured(monkeypatch):
+    async def fake_fetch_pulse(base, token):
+        return {"event": {"agent": None, "text": "1 agent run active now"}, "stats": {"running": 1}}
+
+    monkeypatch.setattr(ap_client, "fetch_pulse", fake_fetch_pulse)
+    client = TestClient(build_routes(lambda: ("http://ap", "tok")))
+    resp = client.get("/api/pulse")
+    assert resp.status_code == 200
+    assert resp.json()["stats"]["running"] == 1
+
+
+def test_default_resolver_is_empty_when_none_given():
     client = TestClient(build_routes())
-    with client.websocket_connect("/ws/echo") as ws:
-        assert ws.receive_json() == {
-            "type": "aw_app_template_init",
-            "data": {"protocol": 1},
-        }
+    assert client.get("/api/bootstrap").status_code == 503
 
 
-def test_ws_echo_round_trip_preserves_re():
+def test_frontend_is_served_at_the_subapp_root():
     client = TestClient(build_routes())
-    with client.websocket_connect("/ws/echo") as ws:
-        ws.receive_json()  # init
-        ws.send_json({"type": "aw_app_template_echo", "data": {"n": 1}, "id": "abc"})
-        assert ws.receive_json() == {
-            "type": "aw_app_template_echo",
-            "data": {"n": 1},
-            "re": "abc",
-        }
-
-        # id is optional — no id in, no re out
-        ws.send_json({"type": "aw_app_template_echo", "data": {"n": 2}})
-        assert ws.receive_json() == {"type": "aw_app_template_echo", "data": {"n": 2}}
-
-
-def test_ws_echo_malformed_frame_gets_literal_error_type_and_stays_open():
-    client = TestClient(build_routes())
-    with client.websocket_connect("/ws/echo") as ws:
-        ws.receive_json()  # init
-
-        ws.send_text("not json")
-        reply = ws.receive_json()
-        assert reply["type"] == "error"
-        assert set(reply["data"]) == {"code", "message"}
-
-        # a non-conforming-but-valid-JSON frame is also an error
-        ws.send_json({"type": "aw_app_template_echo"})  # missing "data"
-        reply = ws.receive_json()
-        assert reply["type"] == "error"
-
-        # socket is still open — a conforming frame right after still echoes
-        ws.send_json({"type": "aw_app_template_echo", "data": {"ok": True}})
-        assert ws.receive_json() == {"type": "aw_app_template_echo", "data": {"ok": True}}
-
-
-def test_ws_echo_ignores_unknown_type_and_stays_open():
-    client = TestClient(build_routes())
-    with client.websocket_connect("/ws/echo") as ws:
-        ws.receive_json()  # init
-
-        ws.send_json({"type": "some_other_type", "data": {}})
-        # no reply for the unrecognised type — the next reply is this one
-        ws.send_json({"type": "aw_app_template_echo", "data": {"still": "open"}})
-        assert ws.receive_json() == {
-            "type": "aw_app_template_echo",
-            "data": {"still": "open"},
-        }
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    assert "Command Center" in resp.text

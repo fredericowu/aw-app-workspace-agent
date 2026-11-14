@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Command Center — Workspace Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div class="boot" id="boot">
+  <div class="boot-mark">◆</div>
+  <div class="boot-text">Linking agent fleet<span class="dots"><i>.</i><i>.</i><i>.</i></span></div>
+</div>
+
+<div class="app" id="app" hidden>
+
+  <!-- ───────────────────────── left rail ───────────────────────── -->
+  <nav class="rail" aria-label="Primary">
+    <button class="rail-logo" id="railLogo" title="Command Center" aria-label="Command Center home">
+      <span class="rail-logo-mark">◆</span>
+    </button>
+
+    <div class="rail-nav" role="tablist" aria-label="Sections">
+      <button class="rail-btn is-active" data-view="fleet" role="tab" aria-selected="true" aria-controls="view-fleet">
+        <span class="rail-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></svg>
+        </span>
+        <span class="rail-label">Fleet</span>
+      </button>
+
+      <button class="rail-btn" data-view="sessions" role="tab" aria-selected="false" aria-controls="view-sessions">
+        <span class="rail-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M4 5h16M4 10h10M4 15h16M4 20h7"/></svg>
+        </span>
+        <span class="rail-label">Sessions</span>
+        <span class="rail-count" id="railSessionCount">0</span>
+      </button>
+
+      <button class="rail-btn" data-view="system" role="tab" aria-selected="false" aria-controls="view-system">
+        <span class="rail-ico" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0-6 6v4l-2 4h16l-2-4V9a6 6 0 0 0-6-6z"/><path d="M9.5 21a2.5 2.5 0 0 0 5 0"/></svg>
+        </span>
+        <span class="rail-label">System</span>
+        <span class="rail-badge" id="railSystemBadge" hidden>0</span>
+      </button>
+    </div>
+
+    <div class="rail-foot">
+      <button class="rail-btn rail-btn--ghost" id="railNew" title="New session (N)" aria-label="New session">
+        <span class="rail-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></span>
+        <span class="rail-label">New</span>
+      </button>
+      <button class="rail-btn rail-btn--ghost" id="railKeys" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
+        <span class="rail-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="19" height="11" rx="2.5"/><path d="M7 11h.01M11 11h.01M15 11h.01M8 14.5h8"/></svg></span>
+        <span class="rail-label">Keys</span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- ───────────────────────── main column ───────────────────────── -->
+  <div class="main">
+
+    <header class="chrome">
+      <div class="chrome-left">
+        <button class="ws-chip" id="wsChip" aria-label="Workspace">
+          <span class="ws-dot"></span>
+          <span class="ws-name" id="wsName">aw-workspace</span>
+          <span class="ws-env" id="wsEnv">self-hosted</span>
+        </button>
+        <nav class="crumbs" id="crumbs" aria-label="Breadcrumb"></nav>
+      </div>
+
+      <button class="cmdk" id="cmdkTrigger" aria-label="Open command palette">
+        <svg viewBox="0 0 24 24" class="cmdk-ico" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+        <span>Jump to agent, session, action…</span>
+        <kbd>⌘K</kbd>
+      </button>
+
+      <div class="chrome-right">
+        <div class="pulse" id="pulse" aria-live="polite" aria-label="Live activity">
+          <span class="pulse-dot"></span>
+          <span class="pulse-text" id="pulseText">listening…</span>
+        </div>
+        <button class="bell" id="bellBtn" aria-label="Open system notifications">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a6 6 0 0 0-6 6v4l-2 4h16l-2-4V9a6 6 0 0 0-6-6z"/><path d="M9.5 21a2.5 2.5 0 0 0 5 0"/></svg>
+          <span class="bell-badge" id="bellBadge" hidden>0</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- ══════════ open-session tab strip (IDE editor tabs) ══════════ -->
+    <!-- Its own grid row, with its own padding below the tabs, so nothing
+         it paints (least of all the active tab's connector) can land on
+         the panel that starts underneath it. -->
+    <div class="tabstrip" id="tabstrip">
+      <div class="tabstrip-scroll" id="tabstripScroll" role="tablist" aria-label="Open sessions"></div>
+      <button class="tab-new" id="tabNew" title="Open another session (N)" aria-label="Open another session">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+    </div>
+
+    <main class="stage" id="stage">
+
+      <!-- ══════════════════ FLEET ══════════════════ -->
+      <section class="view" id="view-fleet" role="tabpanel" aria-label="Agent fleet">
+        <div class="hero">
+          <div class="hero-copy">
+            <h1>Agent fleet</h1>
+            <p>Every agent this workspace can dispatch. Pick one to open a session, or scan the board for what is running right now.</p>
+          </div>
+          <div class="hero-stats" id="heroStats"></div>
+        </div>
+
+        <div class="filters" role="search">
+          <div class="field">
+            <svg viewBox="0 0 24 24" class="field-ico" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+            <input id="agentSearch" type="search" placeholder="Filter agents by name, slug, skill…" aria-label="Filter agents" autocomplete="off" />
+            <button class="field-clear" id="agentSearchClear" hidden aria-label="Clear filter">✕</button>
+          </div>
+          <div class="chipset" id="squadChips" role="group" aria-label="Filter by squad"></div>
+          <div class="chipset chipset--right" id="modelChips" role="group" aria-label="Filter by model"></div>
+          <button class="toggle" id="runningToggle" aria-pressed="false">
+            <span class="toggle-dot"></span> Running only
+          </button>
+        </div>
+
+        <div id="fleetGrids"></div>
+
+        <div class="empty" id="fleetEmpty" hidden>
+          <div class="empty-mark">⌕</div>
+          <h3>No agent matches that</h3>
+          <p id="fleetEmptyWhy">Nothing in the fleet matches the current filters.</p>
+          <button class="btn btn--primary" id="fleetReset">Reset filters</button>
+        </div>
+      </section>
+
+      <!-- ══════════════════ SESSIONS ══════════════════ -->
+      <section class="view" id="view-sessions" role="tabpanel" aria-label="Sessions" hidden>
+        <div class="split" data-pane="list">
+          <aside class="channels" id="channels" aria-label="All sessions">
+            <div class="channels-head">
+              <div class="channels-label">
+                <span>All sessions</span>
+                <span class="channels-hint" id="channelsHint">0 open as tabs</span>
+              </div>
+              <div class="field field--sm">
+                <svg viewBox="0 0 24 24" class="field-ico" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+                <input id="sessionSearch" type="search" placeholder="Search sessions" aria-label="Search sessions" autocomplete="off" />
+              </div>
+              <button class="btn btn--primary btn--block" id="newSessionBtn">
+                <span class="btn-plus" aria-hidden="true">+</span> New session
+              </button>
+              <!-- Scope: who started it, not what state it is in. "User" is
+                   what Frederico typed himself; "Agents" is what a dispatch
+                   opened behind the scenes. -->
+              <div class="seg seg--quad" role="group" aria-label="Session scope">
+                <button class="seg-btn is-active" data-scope="user"
+                        title="Sessions you started yourself — a CLI, Telegram, or the gallery here">
+                  User <span class="seg-n">0</span>
+                </button>
+                <button class="seg-btn" data-scope="agent"
+                        title="Sessions one agent or a scheduled flow dispatched behind the scenes">
+                  Agents <span class="seg-n">0</span>
+                </button>
+                <button class="seg-btn" data-scope="archived"
+                        title="Archived sessions, whoever started them">
+                  Archived <span class="seg-n">0</span>
+                </button>
+                <button class="seg-btn" data-scope="all" title="Everything, archived included">
+                  All <span class="seg-n">0</span>
+                </button>
+              </div>
+            </div>
+            <div class="channels-list" id="channelsList"></div>
+          </aside>
+
+          <div class="thread" id="thread">
+            <div class="empty empty--pane" id="threadEmpty">
+              <div class="empty-mark">◆</div>
+              <h3 id="threadEmptyTitle">No session open</h3>
+              <p id="threadEmptyWhy">Pick a session on the left and it opens as a tab above, or start a new one — you'll go through the agent gallery so you can see who you're talking to.</p>
+              <button class="btn btn--primary" id="threadEmptyNew">
+                <span class="btn-plus" aria-hidden="true">+</span> New session
+              </button>
+              <button class="btn btn--ghost" id="threadEmptyFleet">Browse the fleet</button>
+            </div>
+
+            <div class="thread-body" id="threadBody" hidden>
+              <header class="thread-head">
+                <button class="back-btn" id="threadBack" aria-label="Back to session list">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+                  <span>Sessions</span>
+                </button>
+                <div class="thread-id">
+                  <span class="avatar" id="threadAvatar" aria-hidden="true">◆</span>
+                  <div>
+                    <h2 id="threadTitle">—</h2>
+                    <div class="thread-meta" id="threadMeta"></div>
+                  </div>
+                </div>
+                <div class="thread-actions">
+                  <button class="icon-btn" id="threadPin" aria-label="Pin session" title="Pin to the top of the list">★</button>
+                  <button class="icon-btn" id="threadArchive" aria-label="Archive session" title="Archive">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="4.5" rx="1.5"/><path d="M5 8.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19V8.5"/><path d="M10 12h4"/></svg>
+                  </button>
+                  <button class="icon-btn" id="threadAgent" aria-label="View agent profile" title="Agent profile">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5M12 7.8v.4"/></svg>
+                  </button>
+                </div>
+              </header>
+
+              <div class="msgs" id="msgs" aria-live="polite"></div>
+
+              <form class="composer" id="composer">
+                <div class="composer-box">
+                  <textarea id="composerInput" rows="1" placeholder="Message the agent…  (↵ to send, ⇧↵ for a new line)" aria-label="Message"></textarea>
+                  <button class="send" id="sendBtn" type="submit" aria-label="Send message" disabled>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5"/><path d="M5.5 11.5L12 5l6.5 6.5"/></svg>
+                  </button>
+                </div>
+                <div class="composer-hint" id="composerHint"></div>
+              </form>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ SYSTEM ══════════════════ -->
+      <section class="view" id="view-system" role="tabpanel" aria-label="System notifications" hidden>
+        <div class="hero hero--tight">
+          <div class="hero-copy">
+            <h1>System</h1>
+            <p>Where sysadmin notices and agent questions land. Answer them here and the run that asked picks your reply straight up.</p>
+          </div>
+          <div class="sys-summary" id="sysSummary"></div>
+        </div>
+
+        <div class="seg seg--wide" id="sysFilters" role="group" aria-label="Filter notifications">
+          <button class="seg-btn is-active" data-filter="needs">Needs you <span class="seg-n" id="nNeeds">0</span></button>
+          <button class="seg-btn" data-filter="questions">Agent questions <span class="seg-n" id="nQ">0</span></button>
+          <button class="seg-btn" data-filter="alerts">Alerts <span class="seg-n" id="nA">0</span></button>
+          <button class="seg-btn" data-filter="resolved">Resolved <span class="seg-n" id="nR">0</span></button>
+          <button class="seg-btn" data-filter="all">All</button>
+        </div>
+
+        <div class="sys-list" id="sysList"></div>
+
+        <div class="empty" id="sysEmpty" hidden>
+          <div class="empty-mark">✓</div>
+          <h3 id="sysEmptyTitle">All clear</h3>
+          <p id="sysEmptyWhy">Nothing is waiting on you. New notices appear here and ring the bell in the top bar.</p>
+          <button class="btn btn--ghost" id="sysShowAll">Show everything</button>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- ───────────────────────── notification drawer ───────────────────────── -->
+  <aside class="drawer" id="drawer" aria-label="Notification centre" aria-hidden="true">
+    <header class="drawer-head">
+      <div>
+        <h2>Notifications</h2>
+        <p id="drawerSub">—</p>
+      </div>
+      <button class="icon-btn icon-btn--lg" id="drawerClose" aria-label="Close notifications">✕</button>
+    </header>
+    <div class="drawer-list" id="drawerList"></div>
+    <footer class="drawer-foot">
+      <button class="btn btn--ghost btn--block" id="drawerOpenPanel">Open the full System panel →</button>
+    </footer>
+  </aside>
+
+  <!-- ───────────────────────── agent sheet ───────────────────────── -->
+  <aside class="sheet" id="sheet" aria-label="Agent profile" aria-hidden="true">
+    <div id="sheetInner"></div>
+  </aside>
+
+  <!-- ───────────────────────── gallery picker ───────────────────────── -->
+  <div class="modal" id="picker" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Choose an agent">
+    <div class="modal-card modal-card--wide">
+      <header class="modal-head">
+        <div>
+          <h2>Start a session</h2>
+          <p>Choose who you're talking to. Every agent carries a different contract. It opens as a new tab.</p>
+        </div>
+        <button class="icon-btn icon-btn--lg" id="pickerClose" aria-label="Close">✕</button>
+      </header>
+      <div class="field field--sm picker-search">
+        <svg viewBox="0 0 24 24" class="field-ico" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+        <input id="pickerSearch" type="search" placeholder="Filter agents…" aria-label="Filter agents" autocomplete="off" />
+      </div>
+      <div class="picker-grid" id="pickerGrid"></div>
+      <div class="empty empty--pane" id="pickerEmpty" hidden>
+        <div class="empty-mark">⌕</div>
+        <h3>No match</h3>
+        <p>No agent matches that filter.</p>
+        <button class="btn btn--ghost" id="pickerClear">Clear filter</button>
+      </div>
+      <footer class="modal-foot" id="pickerFoot" hidden>
+        <div class="picked" id="picked"></div>
+        <div class="picked-compose">
+          <textarea id="pickerKickoff" rows="2" placeholder="Optional: what should they start on? (you can also leave this empty)" aria-label="First message"></textarea>
+          <div class="picked-actions">
+            <button class="btn btn--ghost" id="pickerBack">← Pick someone else</button>
+            <button class="btn btn--primary" id="pickerStart">Start session →</button>
+          </div>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <!-- ───────────────────────── command palette ───────────────────────── -->
+  <div class="modal modal--top" id="cmdk" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Command palette">
+    <div class="modal-card modal-card--cmd">
+      <div class="cmd-field">
+        <span class="cmd-prompt" aria-hidden="true">›</span>
+        <input id="cmdInput" type="text" placeholder="Jump to an agent, a session, or run an action…" aria-label="Command" autocomplete="off" />
+        <kbd>esc</kbd>
+      </div>
+      <div class="cmd-list" id="cmdList" role="listbox" aria-label="Results"></div>
+    </div>
+  </div>
+
+  <!-- ───────────────────────── shortcuts ───────────────────────── -->
+  <div class="modal" id="keys" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+    <div class="modal-card">
+      <header class="modal-head">
+        <div><h2>Keyboard</h2><p>Everything here is reachable by mouse too.</p></div>
+        <button class="icon-btn icon-btn--lg" id="keysClose" aria-label="Close">✕</button>
+      </header>
+      <ul class="keylist">
+        <li><kbd>⌘K</kbd> <span>Command palette</span></li>
+        <li><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> <span>Fleet / Sessions / System</span></li>
+        <li><kbd>⌥←</kbd><kbd>⌥→</kbd> <span>Previous / next open tab — also <kbd>[</kbd> <kbd>]</kbd> when you're not typing</span></li>
+        <li><kbd>⌥W</kbd> <span>Close the current tab — also <kbd>W</kbd> when you're not typing</span></li>
+        <li><kbd>N</kbd> <span>New session (opens the gallery)</span></li>
+        <li><kbd>B</kbd> <span>Toggle the notification drawer</span></li>
+        <li><kbd>/</kbd> <span>Focus the filter on the current view</span></li>
+        <li><kbd>↵</kbd> <span>Send a message</span></li>
+        <li><kbd>⇧↵</kbd> <span>New line in a message</span></li>
+        <li><kbd>esc</kbd> <span>Close anything that is open</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <div class="scrim" id="scrim" hidden></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

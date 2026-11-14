@@ -1,19 +1,10 @@
 name: Test
 
 # Push/PR-triggered coverage gate: pytest-cov against pyproject.toml's
-# fail_under=100, blocking. Per docs/standards/pipeline-testing.md — a hard
-# gate here specifically (not the estate's baseline+ratchet default, §4.2),
-# since this template is what every new aw-app-* is born from and is meant
-# to be the quality reference the rest of the estate is measured against
-# (card 3d75bf3b-9510-8172-a929-c1fe4e60254c) — coverage is genuinely at
-# 100% (real behavioral tests, not import-only stubs; impractical lines are
-# excluded explicitly in pyproject.toml's [tool.coverage.report], not left
-# as a silent gap), so the gate now locks that in rather than allowing
-# regression back toward the estate's 80% floor. The shared
-# tekflox/aw-marketplace release workflow (release.yml -> app-release.yml)
-# runs the test suite but has no coverage step yet — that's Phase 2 of the
-# standard's rollout, a separate repo — so until then this repo's own gate
-# lives here.
+# fail_under (a one-way ratchet, §4.2), inherited from aw-app-template. The
+# shared tekflox/aw-marketplace release workflow (release.yml ->
+# app-release.yml) runs the test suite but has no coverage step yet, so
+# this repo's own gate lives here.
 on:
   push:
     branches: [master]
@@ -70,7 +61,7 @@ jobs:
         # — this step still fails (and skips the upload) if coverage drops
         # below fail_under.
         run: |
-          pytest --cov=template_app --cov-report=term-missing \
+          pytest --cov=workspace_agent_app --cov-report=term-missing \
             --cov-report=html --cov-report=xml tests/ -q
       - name: Upload coverage report artifact
         # Downloadable straight from the Actions run's Summary page — no
@@ -84,20 +75,3 @@ jobs:
             htmlcov/
             coverage.xml
           retention-days: 30
-
-  # The CI counterpart to .pre-commit-config.yaml's `eslint` hook, per
-  # docs/standards/pipeline-testing.md §6a — pre-commit must never be the
-  # only place a check runs (bypassable with --no-verify, not installed
-  # until `pre-commit install`). node-version matches ui/package.json's
-  # `engines.node: ">=24"`.
-  ui-lint:
-    runs-on: ${{ fromJSON(startsWith(github.repository, 'tekflox/') && '["self-hosted","aw-baremetal"]' || '"ubuntu-latest"') }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
-        with:
-          node-version: "24"
-      - name: Install UI deps
-        run: npm ci --prefix ui
-      - name: ESLint
-        run: npm run lint --prefix ui

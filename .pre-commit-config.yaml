@@ -10,11 +10,7 @@
 #   pip install -r requirements-dev.txt && pre-commit install
 #   npm install --prefix ui   # only needed if you will touch ui/
 #
-# ruff-format IS enabled here, unlike the aw-app-kb pilot: this template is
-# 13 Python files at a verified 100% coverage, so the one-time whole-file
-# reformat (§6b) was done safely in its own commit before this hook was
-# turned on — `ruff format`/`ruff check --fix` on a future change now only
-# touch the lines that actually changed.
+# ruff-format IS enabled here, inherited from aw-app-template.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.17.3
@@ -37,7 +33,7 @@ repos:
         entry: pylint --disable=all --enable=E --disable=E0401,E1101
         language: system
         types: [python]
-        files: ^template_app/
+        files: ^workspace_agent_app/
 
       - id: validate-manifest
         name: validate aw-app.json
@@ -45,13 +41,6 @@ repos:
         language: system
         pass_filenames: false
         files: ^aw-app\.json$
-
-      - id: eslint
-        name: eslint (ui/)
-        entry: npm run lint --prefix ui
-        language: system
-        pass_filenames: false
-        files: ^ui/.*\.(js|jsx|mjs|cjs)$
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

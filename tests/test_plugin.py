@@ -1,72 +1,76 @@
-"""Unit tests for template_app/plugin.py's TemplateAppPlugin — the app's whole
-aw-workspace integration surface (activate()/deactivate()), previously
-untested (0% coverage) despite being the pattern every aw-app-* Tier-1 app
-copies verbatim (see plugin.py's module docstring).
+"""Unit tests for workspace_agent_app/plugin.py's WorkspaceAgentPlugin —
+activate()/deactivate(), and the config-resolver closure it hands to
+build_routes() (so a settings change takes effect with no restart).
 
 `ctx` is a lightweight double, not the real F4 runtime — activate() only
-touches two gated facades (ctx.commands, ctx.routes) plus ctx.package_dir and
-ctx.config, so that's all the double needs to implement.
+touches `ctx.routes`, `ctx.secrets` and `ctx.config`.
 
-Run: .venv/aw/bin/python -m pytest tests/test_plugin.py -q
+Run: python -m pytest tests/test_plugin.py -q
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from template_app.plugin import TemplateAppPlugin  # noqa: E402
-
-ROOT = Path(__file__).resolve().parent.parent
-MANIFEST = json.loads((ROOT / "aw-app.json").read_text())
+from workspace_agent_app import ap_client  # noqa: E402
+from workspace_agent_app.plugin import WorkspaceAgentPlugin  # noqa: E402
 
 
-def _make_ctx(config=None):
+def _make_ctx(config=None, secret_token=None):
     ctx = MagicMock()
-    ctx.package_dir = str(ROOT)
     ctx.config = config or {}
+    ctx.secrets.read.return_value = secret_token
     return ctx
 
 
-def test_activate_installs_every_manifest_cli_through_the_gated_facade():
-    ctx = _make_ctx({"greeting": "Yo"})
-
-    asyncio.run(TemplateAppPlugin().activate(ctx))
-
-    clis = MANIFEST["contributes"]["system_clis"]
-    assert ctx.commands.install_system_cli.call_count == len(clis)
-    for cli, call in zip(clis, ctx.commands.install_system_cli.call_args_list):
-        args, kwargs = call
-        assert args[0] == cli["name"]
-        assert args[1] == cli["installer"]
-        assert kwargs["uninstall"] == "scripts/uninstall.sh"
-        assert kwargs["verify"] == cli.get("verify")
-
-
-def test_activate_registers_routes_and_sets_greeting_env():
-    ctx = _make_ctx({"greeting": "Yo"})
-
-    asyncio.run(TemplateAppPlugin().activate(ctx))
-
-    assert os.environ["AW_APP_TEMPLATE_GREETING"] == "Yo"
+def test_activate_registers_routes_exactly_once():
+    ctx = _make_ctx()
+    asyncio.run(WorkspaceAgentPlugin().activate(ctx))
     ctx.routes.register.assert_called_once()
 
 
-def test_activate_defaults_greeting_to_hello_without_config():
-    ctx = _make_ctx(config={})
+def test_resolver_prefers_own_config_over_the_inherited_file():
+    ctx = _make_ctx({"agents_platform_base": "http://own"}, secret_token="own-tok")
+    asyncio.run(WorkspaceAgentPlugin().activate(ctx))
 
-    asyncio.run(TemplateAppPlugin().activate(ctx))
+    # ctx.routes.register() receives the FastAPI app build_routes() built
+    # around the resolver closure — exercise the closure indirectly through
+    # the route that calls it rather than reaching into plugin internals.
+    app = ctx.routes.register.call_args[0][0]
+    from fastapi.testclient import TestClient
 
-    assert os.environ["AW_APP_TEMPLATE_GREETING"] == "Hello"
+    client = TestClient(app)
+    resp = client.get("/api/bootstrap")
+    # Own config was fully set, so the resolver did not fall through to
+    # "unconfigured" (503) — the real outbound httpx call then fails to
+    # connect to http://own, which surfaces as 502.
+    assert resp.status_code == 502
+
+
+def test_resolver_falls_back_to_the_runners_app_file_and_warns_once(monkeypatch, caplog):
+    monkeypatch.setattr(ap_client, "_runners_config", lambda: {})
+    ctx = _make_ctx(config={}, secret_token=None)
+
+    plugin = WorkspaceAgentPlugin()
+    asyncio.run(plugin.activate(ctx))
+    app = ctx.routes.register.call_args[0][0]
+
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app)
+    with caplog.at_level("WARNING"):
+        resp1 = client.get("/api/bootstrap")
+        resp2 = client.get("/api/bootstrap")
+
+    assert resp1.status_code == 503
+    assert resp2.status_code == 503
+    assert sum("Fleet will serve 503" in r.message for r in caplog.records) == 1
 
 
 def test_deactivate_completes_without_touching_ctx():
-    # deactivate() takes no ctx — the framework's journal reverse-replay
-    # handles revert; this just proves the coroutine returns cleanly.
-    assert asyncio.run(TemplateAppPlugin().deactivate()) is None
+    assert asyncio.run(WorkspaceAgentPlugin().deactivate()) is None
