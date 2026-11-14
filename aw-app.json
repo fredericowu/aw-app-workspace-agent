@@ -44,13 +44,6 @@
         }
       }
     ],
-    "skills": [
-      {
-        "id": "aw-create-app",
-        "path": "skills/aw-create-app/SKILL.md",
-        "description": "How to author a decoupled aw-workspace app from this template \u2014 manifest, tiers, capabilities, contributes, backend routes (HTTP+WS), frontend code, standalone mode, window widgets, install + marketplace release."
-      }
-    ],
     "knowledge": {
       "path": "docs"
     }
