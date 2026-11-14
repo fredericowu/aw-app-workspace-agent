@@ -40,9 +40,41 @@ Derived facts land in `session_meta` (see `store.py`) and split three ways:
 
 | Group | Columns | Rule |
 |---|---|---|
-| Derive-once | `agent_slug`, `bucket`, `title`, `origin`, `first_run_at` | A session's first run is immutable. Written when missing, never rewritten — re-deriving a title from a partial view is how titles drift. |
+| Root-derived | `bucket`, `title`, `first_run_at`, `agent_slug` | Only valid from a **complete** view of the session's runs — see below. Written only from one, and a complete view always wins over a value an earlier partial one wrote. |
 | Snapshot | `cost_usd`, `tokens_in`, `tokens_out` | Cost is **not** immutable. Keyed on the `cached_run_count` it was computed at; the moment upstream's `run_count` moves, it is recomputed. |
 | App-local | `pinned`, `archived` | Neither exists upstream. `CliSessionUpdate` accepts only name/description, and `retired_at` is the executor's own death marker, not a user action. |
+
+### The completeness precondition — the one that already bit
+
+Every fact taken from a session's **first** run (its bucket, its fallback
+title, when it started) is only valid if `runs[0]` really *is* that first
+run. The sweep is the newest 1000 runs **platform-wide**, so for any session
+older than that window `runs[0]` is a mid-session run, not the root.
+
+`run_count` makes this an exact test rather than a judgement call: the view
+is complete iff we hold at least that many runs. `derive()` and `_persist()`
+both take a `complete` flag, and an incomplete view may not write these
+columns at all.
+
+**This shipped wrong once, in v0.3.0.** The original rule was "derive once,
+never recompute", which sounds conservative and is wrong in the direction
+that matters: it let the *first* view win even when that view could not see
+the root, then locked the mistake in forever. The first request after install
+took the cheap path on a cold cache, and a 486-run Telegram session
+(`planner sonnet`, root `initiator_kind: telegram`) was filed under
+**Agents** — the product constraint failing silently, with no error anywhere.
+Unit tests passed throughout; only running the installed app against real
+data showed it.
+
+The rule is now about the *view*, not the ordering: an authoritative view may
+always correct, a partial one may never write. That also makes the fix
+self-healing — rows poisoned by v0.3.0 are corrected by the next full build,
+with no migration and no manual repair.
+
+Two things ignore the flag on purpose: `created_from == "app"` always buckets
+as the user's (an app-local fact no run can report, and the initiator-kind
+heuristic cannot tell an app dispatch from any other API dispatch), and the
+real `CliSession.name` always wins as the title.
 
 Rename is **not** app-local: it goes through the real
 `PATCH /api/sessions/{session_id}`, so the name is shared with Telegram and

@@ -21,11 +21,23 @@ Whether that sweep is enough for a given session is an exact test, not a
 guess: ``CliSessionOut.run_count`` is authoritative, so a session is fully
 covered iff the sweep yielded that many runs for it. Anything short falls
 back to one lazy ``GET /api/runs?session_id=…`` for that session alone, and
-the derived result is written to ``session_meta`` and never recomputed (see
-store.py for which columns are immutable and which are a snapshot).
+the derived result is cached in ``session_meta`` (see store.py for which
+columns are a one-off derivation and which are a snapshot).
 
 In the steady state that makes a rail refresh exactly two upstream calls,
 however many sessions are listed.
+
+### The precondition to keep in mind when changing any of this
+
+Every fact derived from a session's FIRST run — its User-vs-Agents bucket,
+its fallback title, when it started — is only valid from a **complete** view
+of that session's runs. The sweep is the newest 1000 runs *platform-wide*,
+so for any session older than that window ``runs[0]`` is a mid-session run
+rather than the root. ``derive()`` and ``_persist()`` both take a
+``complete`` flag for exactly this reason, and getting it wrong is not a
+visible crash: it is a Telegram session quietly filed under Agents. That
+shipped once (2026-11-14, v0.3.0) and was caught only by running the
+installed app against real data.
 """
 
 from __future__ import annotations
@@ -118,35 +130,63 @@ def _is_user_started(root: dict) -> bool:
     )
 
 
-def derive(row: dict, runs: list[dict], meta: dict | None) -> dict:
+def derive(row: dict, runs: list[dict], meta: dict | None, *, complete: bool = False) -> dict:
     """Derive one session's display facts.
 
-    ``runs`` must be every run of this session that we can see, ascending by
-    start. ``meta`` is the cached row, if any — its derive-once columns win
-    over a fresh derivation, because a session's first run is immutable and
-    re-deriving it from a partial view is how a title starts drifting.
+    ``runs`` is every run of this session we can see, ascending by start.
+    ``meta`` is the cached row, if any.
+
+    ``complete`` says whether ``runs[0]`` really is the session's ROOT run,
+    and it decides who wins:
+
+    * ``complete=True`` — derive from the runs and let that OVERRIDE the
+      cache. The root is authoritative, so this is also the repair path for a
+      row an earlier partial view got wrong.
+    * ``complete=False`` — prefer the cache, because ``runs[0]`` is then just
+      the oldest run that happened to be inside the sweep window. Deriving a
+      bucket or a title from that is what mis-bucketed a 486-run Telegram
+      session as Agents (2026-11-14); see ``_persist``.
+
+    Two things ignore the flag, on purpose:
+
+    * ``created_from == "app"`` always buckets as the user's. It is an
+      app-local fact, not something any run can tell us, and the
+      initiator-kind heuristic cannot distinguish an app-started session
+      from any other API dispatch.
+    * the real ``CliSession.name`` always wins as the title. It is shared
+      with every other consumer (that is what ``PATCH /api/sessions``
+      writes), so a derived preview must never shadow it.
     """
     meta = meta or {}
     root = runs[0] if runs else {}
     newest = runs[-1] if runs else {}
 
     created_from = meta.get("created_from")
-    bucket = meta.get("bucket")
-    if not bucket:
-        bucket = "user" if (created_from == "app" or _is_user_started(root)) else "agent"
+    if created_from == "app":
+        bucket = "user"
+    elif complete and runs:
+        bucket = "user" if _is_user_started(root) else "agent"
+    else:
+        bucket = meta.get("bucket") or ("user" if _is_user_started(root) else "agent")
 
-    # The agent you would be talking to now is the one that ran most
-    # recently; the root only matters when there is nothing newer.
-    agent = meta.get("agent_slug") or newest.get("source_slug") or root.get("source_slug") or ""
+    # The agent you would be talking to now is whoever ran most recently, and
+    # the newest run we can SEE is authoritative for that on either path —
+    # a session handed from Architect to Coder to QA must not keep answering
+    # as the agent that opened it. The cache is only the fallback.
+    agent = newest.get("source_slug") or root.get("source_slug") or meta.get("agent_slug") or ""
 
-    # The real CliSession name wins whenever it is set — it is shared with
-    # every other consumer (that is what PATCH /api/sessions writes), so it
-    # must not be shadowed by a cached preview of the first prompt.
     title = (row.get("name") or "").strip()
     if not title:
-        title = meta.get("title") or _one_line(run_prompt(root), _TITLE_CHARS)
+        derived_title = _one_line(run_prompt(root), _TITLE_CHARS)
+        title = (
+            derived_title if (complete and derived_title) else (meta.get("title") or derived_title)
+        )
     if not title:
         title = f"Session {str(row.get('session_id') or '')[:8]}"
+
+    first_at = _epoch(root.get("started_at"))
+    if not (complete and first_at):
+        first_at = meta.get("first_run_at") or first_at
 
     return {
         "agent_slug": agent,
@@ -154,7 +194,7 @@ def derive(row: dict, runs: list[dict], meta: dict | None) -> dict:
         "title": title,
         "origin": meta.get("origin") or None,
         "created_from": created_from,
-        "first_run_at": meta.get("first_run_at") or _epoch(root.get("started_at")),
+        "first_run_at": first_at,
     }
 
 
@@ -323,7 +363,12 @@ async def build_rail(base: str, token: str, store, full: bool = True) -> dict:
             continue
         meta = cached.get(sid) or {}
         runs = plan[sid]
-        derived = derive(row, runs if runs is not None else [], meta)
+        # run_count is authoritative, so this is an exact test of "is runs[0]
+        # really this session's root run" — the precondition every
+        # root-derived fact depends on. It also covers a backfill that hit
+        # the 1000-run ceiling.
+        complete = runs is not None and len(runs) >= int(row.get("run_count") or 0)
+        derived = derive(row, runs if runs is not None else [], meta, complete=complete)
         if runs is None:
             totals_ = {
                 "cost_usd": meta.get("cost_usd") or 0.0,
@@ -332,7 +377,7 @@ async def build_rail(base: str, token: str, store, full: bool = True) -> dict:
             }
         else:
             totals_ = totals(runs)
-            _persist(store, sid, row, meta, derived, totals_)
+            _persist(store, sid, row, meta, derived, totals_, complete=complete)
         sessions.append(shape_session(row, runs or [], derived, totals_, meta))
 
     sessions.sort(key=lambda s: s["updated_at"], reverse=True)
@@ -415,39 +460,69 @@ async def build_rail_fast(base: str, token: str, store) -> dict:
             "retired_at": meta.get("retired_at"),
             "retired_reason": meta.get("retired_reason"),
         }
-        derived = derive(row, runs, meta)
+        derived = derive(row, runs, meta, complete=False)
         if fresh or not known:
-            _persist(store, sid, row, meta, derived, totals_)
+            # NEVER complete: the sweep is the newest 1000 runs platform-wide,
+            # so for any session older than that window runs[0] is a
+            # mid-session run, not the root. Writing a bucket or title from
+            # that view is what mis-bucketed a Telegram session on 2026-11-14
+            # — see _persist. The snapshot columns are still exact (they are
+            # deltas, not root-derived), and the ≤60s full build fills in and
+            # corrects the rest.
+            _persist(store, sid, row, meta, derived, totals_, complete=False)
         sessions.append(shape_session(row, runs, derived, totals_, meta))
 
     sessions.sort(key=lambda s: s["updated_at"], reverse=True)
     return {"sessions": sessions[:SESSION_LIMIT], "backfilled": 0, "full": False}
 
 
-def _persist(store, sid: str, row: dict, meta: dict, derived: dict, totals_: dict) -> None:
+def _persist(
+    store,
+    sid: str,
+    row: dict,
+    meta: dict,
+    derived: dict,
+    totals_: dict,
+    *,
+    complete: bool,
+) -> None:
     """Write back only what actually changed.
 
     Three groups, with different rules:
 
-    * **derive-once** (agent, bucket, title, first run) — written only when
-      missing. A session's first run is immutable, so re-deriving it from a
-      partial view is how a title starts drifting.
+    * **derive-once** (agent, bucket, title, first run) — written ONLY from a
+      ``complete`` view, i.e. one where ``runs[0]`` really is the session's
+      root run. Caught live on 2026-11-14: a 486-run Telegram session
+      ("planner sonnet") was bucketed **Agents** because the first request
+      after install took the cheap path on a cold cache, where the sweep
+      holds only that session's recent runs — so ``runs[0]`` was a mid-session
+      ``wakeup`` rather than the ``telegram`` root, and "derive once, never
+      recompute" then made the wrong answer permanent. That is the product
+      constraint failing silently, which is exactly the thing this app exists
+      to get right.
     * **the cost snapshot** — written whenever the run count it is keyed on
       has moved, because cost is not immutable.
     * **the /api/sessions mirror** (name, retired, last status/run) — always
       written, so the cheap refresh can read what only that endpoint knows
       without calling it. Writing the same value back is a harmless no-op
       upsert; the alternative is a staleness rule per column.
+
+    A complete view OVERWRITES a derive-once value rather than only filling a
+    blank one. That is what makes the bug above self-healing: a row poisoned
+    by a partial view is corrected by the next full build (≤60s), with no
+    migration and no manual repair. The anti-drift property still holds,
+    because an incomplete view can no longer write these columns at all.
     """
     write: dict[str, Any] = {}
-    for col, key in (
-        ("agent_slug", "agent_slug"),
-        ("bucket", "bucket"),
-        ("title", "title"),
-        ("first_run_at", "first_run_at"),
-    ):
-        if not meta.get(col) and derived.get(key):
-            write[col] = derived[key]
+    if complete:
+        for col, key in (
+            ("agent_slug", "agent_slug"),
+            ("bucket", "bucket"),
+            ("title", "title"),
+            ("first_run_at", "first_run_at"),
+        ):
+            if derived.get(key) and meta.get(col) != derived[key]:
+                write[col] = derived[key]
     want = int(row.get("run_count") or 0)
     if meta.get("cached_run_count") != want:
         write.update(totals_, cached_run_count=want)
@@ -531,9 +606,13 @@ async def build_thread(base: str, token: str, store, session_id: str) -> dict:
     row = row if isinstance(row, dict) else {"session_id": session_id}
 
     meta = store.meta(session_id) or {}
-    derived = derive(row, runs, meta)
+    # This fetch is per-session and unsummarized, so it holds the root run
+    # unless the session has more runs than the limit — same exact test as
+    # the full rail build.
+    complete = bool(runs) and len(runs) >= int(row.get("run_count") or 0)
+    derived = derive(row, runs, meta, complete=complete)
     totals_ = totals(runs)
-    _persist(store, session_id, row, meta, derived, totals_)
+    _persist(store, session_id, row, meta, derived, totals_, complete=complete)
 
     session = shape_session(row, runs, derived, totals_, meta)
     session["messages"] = build_messages(runs)
