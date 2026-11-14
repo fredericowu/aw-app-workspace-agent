@@ -146,7 +146,11 @@ def shape_bootstrap(agents: list[dict], groups: list[dict], runs: list[dict]) ->
     separate cards, not yet wired; shipping a fixed roster there would be the
     exact mock data this build is required to ship none of."""
     live_agents = [a for a in agents if not a.get("deleted_at")]
-    running = _running_slugs(runs)
+    # /api/runs' source_slug can name a workflow (e.g. a kanban-sweep run),
+    # not just an agent — restrict to slugs that are actually in the fleet
+    # so the hero "Running now" count never disagrees with how many agent
+    # cards actually render as running.
+    running = _running_slugs(runs) & {a["slug"] for a in live_agents}
 
     squads = [
         {"key": g["slug"], "label": g["name"], "blurb": g.get("description") or ""} for g in groups

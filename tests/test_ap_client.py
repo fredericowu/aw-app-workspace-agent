@@ -203,6 +203,24 @@ def test_shape_bootstrap_drops_soft_deleted_agents():
     assert data["stats"]["agents"] == 1
 
 
+def test_shape_bootstrap_running_stat_excludes_non_agent_source_slugs():
+    # A workflow run (e.g. a kanban-sweep) carries a source_slug that is not
+    # in /api/agents at all — it must not inflate "Running now" past the
+    # number of agent cards actually marked running (caught live: hero said
+    # 6, only 5 agent cards were is-running, because a kanban-sweep workflow
+    # run's source_slug doesn't match any agent).
+    data = ap_client.shape_bootstrap(
+        [AGENT],
+        [GROUP],
+        [
+            {"source_slug": "architect", "status": "running"},
+            {"source_slug": "kanban-sweep", "status": "running"},
+        ],
+    )
+    assert data["stats"]["running"] == 1
+    assert sum(1 for a in data["agents"] if a["status"] == "running") == 1
+
+
 def test_shape_bootstrap_no_ungrouped_bucket_when_every_agent_has_a_real_group():
     data = ap_client.shape_bootstrap([AGENT], [GROUP], [])
     assert [s["key"] for s in data["squads"]] == ["devteam"]
