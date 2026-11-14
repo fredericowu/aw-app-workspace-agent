@@ -18,11 +18,26 @@
    behind the scenes (`source` on the session, `origin` naming the caller).
    Archived and All sit alongside those two.
 
-   Fleet is wired to the live Agents Platform over RELATIVE fetch paths
-   ("api/...") — this app's own backend serves the page at its mount root,
-   so those resolve under /api/apps/workspace-agent/api/*. Sessions and
-   System are separate cards; their endpoints don't exist yet here, so any
-   call into them degrades client-side (see sendMessage/replyTo below).
+   Fleet and Sessions are wired to the live Agents Platform over RELATIVE
+   fetch paths ("api/...") — this app's own backend serves the page at its
+   mount root, so those resolve under /api/apps/workspace-agent/api/*.
+   System is a separate card; its endpoints don't exist yet here, so calls
+   into it degrade client-side (see replyTo below).
+
+   WHAT A SESSION IS HERE — the thing most likely to mislead a reader of this
+   file. A session is a real CLI session (the same one Telegram and every
+   agent dispatch create), and A MESSAGE IS A RUN: your text is the run's
+   input, the agent's reply is its output, and that run's own token counts and
+   cost_usd are what the turn cost. So:
+
+     * Real runs take 3-15 MINUTES, not milliseconds. The in-flight state is
+       load-bearing, not decoration — see sendMessage/attachStream.
+     * A new session has NO id until the CLI mints one. Until then the tab is
+       keyed on `run:<run_id>` and a second send is QUEUED, not dispatched,
+       because dispatching it without the session id would fork a second
+       session instead of continuing this one. See PENDING/resolvePending.
+     * Every send spends real money. Cost rides on the turn and on the
+       session, because an interface that hides it is a product defect.
    =========================================================================== */
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -137,6 +152,23 @@ function toast(text, kind = '') {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Real money, and small amounts of it — so never round a non-zero cost to
+    "$0.00" and imply the turn was free. */
+function money(usd) {
+  const n = Number(usd || 0);
+  if (!n) return '$0';
+  if (n < 0.01) return `$${n.toFixed(4)}`;
+  if (n < 1) return `$${n.toFixed(3)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+function tokens(n) {
+  const v = Number(n || 0);
+  if (v < 1000) return String(v);
+  if (v < 1e6) return `${(v / 1000).toFixed(v < 10000 ? 1 : 0)}k`;
+  return `${(v / 1e6).toFixed(1)}M`;
+}
+
 /* ================================================================= ROUTER */
 
 function setView(view, { silent = false } = {}) {
@@ -242,6 +274,11 @@ function closeTab(id, { quiet = false } = {}) {
   if (i < 0) return;
   S.openTabs.splice(i, 1);
 
+  // A draft never ran, so there is no session behind it and nothing in the
+  // rail to go back to — closing the tab IS discarding it. Anything that
+  // has run stays in the list, as the toast below promises.
+  if (isDraft(id)) S.sessions = S.sessions.filter((s) => s.id !== id);
+
   // closing the active tab hands focus to its neighbour, like an editor
   if (S.activeSession === id) {
     const next = S.openTabs[i] ?? S.openTabs[i - 1] ?? null;
@@ -251,7 +288,11 @@ function closeTab(id, { quiet = false } = {}) {
   renderTabs();
   renderCrumbs();
   if (S.view === 'sessions') { renderChannels(); renderThread(); }
-  if (!quiet) toast('Tab closed — the session is still in the list');
+  if (!quiet) {
+    toast(isDraft(id)
+      ? 'Draft discarded — it never dispatched a run'
+      : 'Tab closed — the session is still in the list');
+  }
 }
 
 function cycleTab(dir) {
@@ -492,8 +533,87 @@ function originPhrase(s) {
 
 function lastPreview(s) {
   const m = s.messages[s.messages.length - 1];
-  if (!m) return 'No messages yet — say something to get going.';
-  return `${m.role === 'user' ? 'You: ' : ''}${m.text.replace(/\s+/g, ' ').slice(0, 90)}`;
+  // A rail entry whose thread has never been opened has no messages, but the
+  // backend already derived a preview from its newest run — use that rather
+  // than claiming an active session is empty.
+  if (!m) return s.preview || 'No messages yet — say something to get going.';
+  if (m.pending) return 'Thinking…';
+  return `${m.role === 'user' ? 'You: ' : ''}${String(m.text || '').replace(/\s+/g, ' ').slice(0, 90)}`;
+}
+
+/* --- in-flight runs -------------------------------------------------------
+
+   Three things have to survive across turns, and none of them belongs on a
+   session object that gets replaced wholesale by every rail refresh:
+
+   PENDING  — session id => { runId, queue: [text] }. A session whose id has
+              not been minted yet, or whose current turn is still running.
+              `queue` is why a second message during a 10-minute run is held
+              rather than dispatched: a send with no session_id forks a new
+              session, and a send with one while the CLI is mid-turn queues
+              behind the executor's per-session lock anyway.
+   STREAMS  — run id => EventSource. Closed on tab close and on run end.
+   POLLERS  — run id => interval handle. The belt-and-braces fallback, so a
+              wedged stream cannot strand the UI in "thinking" forever.
+*/
+
+const PENDING = new Map();
+const STREAMS = new Map();
+const POLLERS = new Map();
+
+const POLL_MS = 15000;   // run-row fallback poll while a run is in flight
+const RAIL_MS = 10000;   // rail refresh — a Telegram session must show up fast
+
+function pendingOf(id) { return PENDING.get(id) || null; }
+
+function isDraft(id) { return String(id || '').startsWith('draft:'); }
+function isUnresolved(id) { return String(id || '').startsWith('run:'); }
+
+/** Does this agent's model run through a coding CLI?
+
+    Only those mint a CLI session, which is the only kind of session this app
+    shows — so an agent on a plain API model answers once and leaves nothing
+    to resume. 84 of 92 agents here are CLI-backed; the other 8 are not, and
+    the Fleet gallery offers all of them. */
+function resumable(agent) {
+  const m = S.models[agent?.model];
+  return m ? m.resumable !== false : true;   // unknown model: assume it works
+}
+
+/** Can this session take a message right now? */
+function sendState(s) {
+  if (!s) return { ok: false, why: '' };
+  if (s.retired) {
+    return {
+      ok: false,
+      why: `This session was retired by the platform${s.retired_reason ? ` (${s.retired_reason})` : ''}`
+        + ' — it cannot be resumed. Start a new one with the same agent.',
+    };
+  }
+  // Confirmed un-resumable: the first run finished and the platform never
+  // minted a session id. Sending still works — it just starts a fresh run
+  // each time rather than continuing one.
+  if (s.no_session) {
+    return {
+      ok: true,
+      why: `${agentBy(s.agent)?.name ?? s.agent} does not run through a coding CLI, so there is no `
+        + 'session to resume — each message is a standalone run, and this tab is the only place '
+        + 'the thread is kept.',
+    };
+  }
+  const p = pendingOf(s.id);
+  if (p && isUnresolved(s.id)) {
+    return { ok: 'queue', why: 'Waiting for the CLI to mint this session id — your next message is queued until it does.' };
+  }
+  if (p) return { ok: 'queue', why: 'A turn is still running — your next message is queued until it finishes.' };
+  return { ok: true, why: '' };
+}
+
+function stopWatching(runId) {
+  const es = STREAMS.get(runId);
+  if (es) { es.close(); STREAMS.delete(runId); }
+  const t = POLLERS.get(runId);
+  if (t) { clearInterval(t); POLLERS.delete(runId); }
 }
 
 function scopedSessions() {
@@ -502,8 +622,11 @@ function scopedSessions() {
     if (!inScope(s, S.scope)) return false;
     if (!q) return true;
     const ag = agentBy(s.agent);
-    const hay = [s.title, s.target, s.origin, ag?.name, s.agent, ...s.messages.map((m) => m.text)]
-      .join(' ').toLowerCase();
+    // s.preview is in the haystack because most rail entries have never had
+    // their thread loaded, so s.messages is empty for them — searching only
+    // messages would silently match nothing outside the tabs you have open.
+    const hay = [s.title, s.target, s.origin, s.preview, ag?.name, s.agent,
+                 ...s.messages.map((m) => m.text)].join(' ').toLowerCase();
     return hay.includes(q);
   });
 }
@@ -624,6 +747,33 @@ function openSession(id) {
   renderChannels();
   renderThread();
   renderCrumbs();
+  loadThread(id);
+}
+
+/** Fetch a session's real transcript — every run, unsummarized.
+
+    Lazy on purpose: the rail carries 100 sessions and a transcript is the
+    one payload that is genuinely large. `loaded` makes a re-open free, and
+    `loading` keeps a double-click from firing two fetches. */
+async function loadThread(id) {
+  const s = S.sessions.find((x) => x.id === id);
+  if (!s || s.loaded || s.loading || isDraft(id) || isUnresolved(id)) return;
+  s.loading = true;
+  try {
+    const r = await api(`sessions/${encodeURIComponent(id)}/thread`);
+    Object.assign(s, r.session, { loading: false, unread: 0 });
+    // A session can be mid-turn when you open it — somebody else's dispatch,
+    // or your own from before a reload. Pick the stream back up.
+    if (r.session.live_run_id) {
+      PENDING.set(id, { runId: r.session.live_run_id, queue: pendingOf(id)?.queue || [] });
+      watchRun(id, r.session.live_run_id);
+    }
+  } catch (err) {
+    s.loading = false;
+    s.loadError = err.message;
+  }
+  if (S.activeSession === id) { renderThread(); }
+  renderChannels();
 }
 
 function renderThread() {
@@ -648,20 +798,30 @@ function renderThread() {
   av.textContent = a?.glyph ?? '◆';
   $('#threadBody').style.setProperty('--h', hueOf(a));
   $('#threadTitle').textContent = s.title;
+  const cost = Number(s.cost_usd || 0);
   $('#threadMeta').innerHTML = `
     <span class="status status--${a?.status}"><i></i>${a?.status}</span>
     <span>${esc(a?.name ?? s.agent)}</span>
     <span class="mono">${esc(modelLabel(a))}</span>
     <span class="mono" title="${s.source === 'agent' ? 'Opened by a dispatch, not typed by you' : 'You opened this one yourself'}">${esc(originPhrase(s))}</span>
-    ${s.target ? `<span class="mono">target: ${esc(s.target)}</span>` : ''}
+    ${s.run_count ? `<span class="mono" title="A message here is one platform run">${s.run_count} turn${s.run_count > 1 ? 's' : ''}</span>` : ''}
+    ${cost ? `<span class="mono" title="Real spend on this session: ${tokens(s.tokens_in)} in / ${tokens(s.tokens_out)} out">${money(cost)}</span>` : ''}
+    ${s.retired ? '<span class="tag tag--mono" title="The platform retired this session — it cannot be resumed">retired</span>' : ''}
     ${s.state === 'archived' ? '<span class="tag tag--mono">archived</span>' : ''}`;
 
   $('#threadPin').classList.toggle('is-on', !!s.pinned);
   $('#threadPin').setAttribute('aria-label', s.pinned ? 'Unpin session' : 'Pin session');
   $('#threadArchive').setAttribute('aria-label', s.state === 'archived' ? 'Unarchive session' : 'Archive session');
-  $('#composerHint').textContent = s.state === 'archived'
-    ? 'This session is archived — sending a message reopens it.'
-    : 'Sessions aren’t wired to a real agent run yet — this message stays in this tab only.';
+  $('#threadRename').disabled = isDraft(s.id) || isUnresolved(s.id);
+
+  const send = sendState(s);
+  $('#composerInput').disabled = send.ok === false;
+  $('#composerHint').textContent = send.why
+    || (s.state === 'archived'
+      ? 'This session is archived — sending a message reopens it.'
+      : isDraft(s.id)
+        ? `Nothing has been dispatched yet. Your first message starts a real run with ${a?.name ?? s.agent}.`
+        : 'Each message is a real run — typically 3-15 minutes, and it costs money.');
 
   const box = $('#msgs');
   let lastDay = null;
@@ -670,88 +830,338 @@ function renderThread() {
     const sep = d !== lastDay ? `<div class="day-sep">${esc(d)}</div>` : '';
     lastDay = d;
     return sep + msgHtml(m, a);
-  }).join('') || `
+  }).join('') || (s.loading ? `
+    <div class="empty empty--pane">
+      <div class="empty-mark">◆</div>
+      <h3>Loading the transcript…</h3>
+      <p>Reading every run on this session from the platform.</p>
+    </div>` : s.loadError ? `
+    <div class="empty empty--pane">
+      <div class="empty-mark" style="color:var(--crit)">!</div>
+      <h3>Could not load this thread</h3>
+      <p><code>${esc(s.loadError)}</code></p>
+    </div>` : `
     <div class="empty empty--pane">
       <div class="empty-mark">◆</div>
       <h3>Nothing said yet</h3>
       <p>This session is open with ${esc(a?.name ?? s.agent)} but empty. Send the first message below.</p>
-    </div>`;
+    </div>`);
   box.scrollTop = box.scrollHeight;
+}
+
+/** The cost line under an agent turn.
+
+    Shown for every finished agent turn, including a zero-cost one: a visible
+    "$0" is information (a cached or free-tier turn), while hiding the line
+    makes an expensive turn and a free one look identical. */
+function turnMeta(m) {
+  if (m.role !== 'agent' || m.pending) return '';
+  const bits = [
+    `<span title="What this turn cost">${money(m.cost_usd)}</span>`,
+    `<span title="Tokens in / out">${tokens(m.tokens_in)} ↓ ${tokens(m.tokens_out)} ↑</span>`,
+  ];
+  if (m.model) bits.push(`<span>${esc(m.model)}</span>`);
+  if (m.status && m.status !== 'success') bits.push(`<span class="turn-bad">${esc(m.status)}</span>`);
+  if (m.run_id) {
+    bits.push(`<button class="turn-trace" data-trace="${esc(m.run_id)}"
+                       title="Show this run's tool calls">tool trace</button>`);
+  }
+  return `<div class="turn-meta mono">${bits.join('<i>·</i>')}</div>`;
 }
 
 function msgHtml(m, a) {
   const mine = m.role === 'user';
+  // An in-flight turn is the normal case here, not an edge case: the run it
+  // is waiting on takes minutes. It gets the same bubble as a finished one so
+  // the thread does not reflow when the answer lands.
+  if (m.pending) {
+    return `
+      <div class="msg msg--agent msg--pending" style="--h:${hueOf(a)}" data-run="${esc(m.run_id || '')}">
+        <span class="msg-av" aria-hidden="true">${a?.glyph ?? '◆'}</span>
+        <div>
+          <div class="msg-who">${esc(a?.name ?? 'Agent')}
+            <span class="mono">${esc(m.phase || 'thinking')}… ${agoPhrase(m.at)}</span></div>
+          <div class="msg-text">${m.text ? md(m.text)
+            : '<span class="typing"><i></i><i></i><i></i></span>'}</div>
+          ${m.trace ? `<div class="turn-meta mono"><span>${esc(m.trace)}</span></div>` : ''}
+        </div>
+      </div>`;
+  }
   return `
-    <div class="msg msg--${mine ? 'user' : 'agent'}" style="--h:${hueOf(a)}">
+    <div class="msg msg--${mine ? 'user' : 'agent'}" style="--h:${hueOf(a)}"
+         data-run="${esc(m.run_id || '')}">
       <span class="msg-av" aria-hidden="true">${mine ? 'F' : (a?.glyph ?? '◆')}</span>
       <div>
         <div class="msg-who">${mine ? 'You' : esc(a?.name ?? 'Agent')}
           <span class="mono">${clock(m.at)}</span></div>
-        <div class="msg-text">${md(m.text)}</div>
+        <div class="msg-text">${md(m.text) || '<span class="mono">(no reply text)</span>'}</div>
+        ${turnMeta(m)}
       </div>
     </div>`;
 }
 
+/** Send a message — i.e. dispatch a real agent run.
+
+    The 2-second acceptance criterion is met by ORDER, not by speed: the user
+    turn and the in-flight bubble are painted from local state before the
+    fetch is awaited, and the dispatch endpoint returns its run_id without
+    waiting for the run. Nothing here blocks on the 3-15 minutes that
+    follow. */
 async function sendMessage(text) {
   const s = S.sessions.find((x) => x.id === S.activeSession);
   if (!s || !text.trim()) return;
-  const a = agentBy(s.agent);
 
-  s.messages.push({ role: 'user', text, kind: 'text', at: Date.now() / 1000 });
-  s.updated_at = Date.now() / 1000;
-  if (s.state === 'archived') { s.state = 'open'; toast('Session reopened', 'ok'); }
-  renderThread();
-  renderChannels();
+  const send = sendState(s);
+  if (send.ok === false) { toast(send.why, 'warn'); return; }
 
-  // typing indicator
-  const box = $('#msgs');
-  const pend = document.createElement('div');
-  pend.className = 'msg msg--agent msg--pending';
-  pend.style.setProperty('--h', hueOf(a));
-  pend.innerHTML = `
-    <span class="msg-av" aria-hidden="true">${a?.glyph ?? '◆'}</span>
-    <div><div class="msg-who">${esc(a?.name ?? 'Agent')}
-      <span class="mono">thinking…</span></div>
-      <div class="msg-text"><span class="typing"><i></i><i></i><i></i></span></div></div>`;
-  box.append(pend);
-  box.scrollTop = box.scrollHeight;
-
-  let reply;
-  try {
-    const r = await api(`sessions/${s.id}/messages`, {
-      method: 'POST', body: JSON.stringify({ text }),
-    });
-    reply = r.reply;
-  } catch (err) {
-    pend.remove();
-    s.messages.push({
-      role: 'agent',
-      text: `Sessions aren't wired to a real agent yet (\`${err.message}\`), so there is no reply to show. `
-        + 'Your message is still in the thread.',
-      at: Date.now() / 1000,
-    });
+  // A turn is already in flight (or the session id has not been minted yet):
+  // hold this message instead of dispatching it. Dispatching now would
+  // either fork a second session or just queue behind the executor's own
+  // per-session lock with no feedback to the user.
+  if (send.ok === 'queue') {
+    const p = pendingOf(s.id);
+    p.queue.push(text);
+    s.messages.push({ role: 'user', text, at: Date.now() / 1000, queued: true });
     renderThread();
-    toast('Sessions aren’t wired yet');
+    toast(`Queued — ${p.queue.length} message${p.queue.length > 1 ? 's' : ''} waiting for this turn to finish`);
     return;
   }
 
-  // stream it in so the surface feels alive
-  await sleep(380);
-  const target = $('.msg-text', pend);
-  $('.mono', pend).textContent = clock(reply.at);
-  target.innerHTML = '';
-  const words = reply.text.split(' ');
-  for (let i = 0; i < words.length; i += 3) {
-    target.innerHTML = md(words.slice(0, i + 3).join(' '));
-    box.scrollTop = box.scrollHeight;
-    await sleep(26);
-  }
-  pend.classList.remove('msg--pending');
-  if (!s.messages.includes(reply)) s.messages.push(reply);
+  // Paint first. Everything below this point is already visible to the user.
+  s.messages.push({ role: 'user', text, at: Date.now() / 1000 });
+  s.messages.push({ role: 'agent', text: '', at: Date.now() / 1000, pending: true, phase: 'dispatching' });
   s.updated_at = Date.now() / 1000;
+  if (s.state === 'archived') { s.state = 'open'; unarchive(s); }
   renderThread();
   renderChannels();
-  renderTabs();
+
+  // Dispatch WITHOUT a session_id when there is no session to continue: a
+  // draft that has never run, or an agent that turned out not to mint one.
+  const fresh = isDraft(s.id) || s.no_session;
+  try {
+    const r = fresh
+      ? await api('sessions', {
+        method: 'POST',
+        body: JSON.stringify({ agent: s.agent, first_message: text }),
+      })
+      : await api(`sessions/${encodeURIComponent(s.id)}/messages`, {
+        method: 'POST', body: JSON.stringify({ text }),
+      });
+
+    const live = s.messages[s.messages.length - 1];
+    live.run_id = r.run_id;
+    live.phase = 'running';
+
+    if (fresh) {
+      // The run exists but its session does not have an id yet. Re-key the
+      // tab onto the run so a reload (or the rail refresh) can find it, and
+      // let the poller swap in the real session id when the CLI mints it.
+      rekeySession(s, `run:${r.run_id}`);
+    }
+    PENDING.set(s.id, { runId: r.run_id, queue: pendingOf(s.id)?.queue || [] });
+    watchRun(s.id, r.run_id);
+    renderThread();
+    renderChannels();
+    renderTabs();
+  } catch (err) {
+    const live = s.messages[s.messages.length - 1];
+    live.pending = false;
+    live.text = `The dispatch was refused: \`${err.message}\`. Nothing is running — `
+      + 'your message is still here, so you can retry it.';
+    live.status = 'error';
+    renderThread();
+    toast('Dispatch refused', 'warn');
+  }
+}
+
+/** Swap a session's id in place, keeping its tab and selection.
+
+    Needed exactly once per new session: a draft becomes `run:<id>`, and then
+    `run:<id>` becomes the real session id. Rewriting openTabs/activeSession
+    rather than closing and reopening keeps the user's place. */
+function rekeySession(s, nextId) {
+  const prev = s.id;
+  if (prev === nextId) return;
+  const p = PENDING.get(prev);
+  PENDING.delete(prev);
+  s.id = nextId;
+  s.session_id = isUnresolved(nextId) || isDraft(nextId) ? null : nextId;
+  if (p) PENDING.set(nextId, p);
+  S.openTabs = S.openTabs.map((id) => (id === prev ? nextId : id));
+  if (S.activeSession === prev) S.activeSession = nextId;
+}
+
+/** Watch an in-flight run two independent ways.
+
+    The stream is the good path — it carries the tool trace and the reply as
+    it is written. The 15s poll exists because a stream that wedges (a proxy
+    that buffers, a socket a sleeping laptop never reopens) is indistinguishable
+    from an agent that is still thinking, and the failure mode is a UI stuck
+    on "thinking" forever. Whichever notices the run ended first wins; both
+    funnel into finishRun, which is idempotent. */
+function watchRun(sessionId, runId) {
+  attachStream(sessionId, runId);
+  if (!POLLERS.has(runId)) {
+    POLLERS.set(runId, setInterval(() => pollRun(sessionId, runId), POLL_MS));
+  }
+  // Poll once straight away too: a brand-new session's id can resolve within
+  // seconds, and the tab should stop saying "waiting for an id" that fast.
+  pollRun(sessionId, runId);
+}
+
+function attachStream(sessionId, runId) {
+  if (STREAMS.has(runId)) return;
+  let es;
+  try {
+    es = new EventSource(`api/runs/${encodeURIComponent(runId)}/stream`);
+  } catch {
+    return; // no EventSource — the poll alone still finishes the turn
+  }
+  STREAMS.set(runId, es);
+
+  const live = () => {
+    const s = S.sessions.find((x) => x.id === sessionId)
+      || S.sessions.find((x) => x.session_id === sessionId);
+    const m = s && s.messages[s.messages.length - 1];
+    return m && m.pending && m.run_id === runId ? { s, m } : null;
+  };
+
+  const onEvent = (kind) => (ev) => {
+    const ctx = live();
+    if (!ctx) return;
+    let payload = {};
+    try { payload = JSON.parse(ev.data || '{}').payload || {}; } catch { /* keep going */ }
+    if (kind === 'llm_token' && payload.delta) {
+      ctx.m.text += payload.delta;
+      ctx.m.phase = 'writing';
+    } else if (kind === 'tool_call') {
+      ctx.m.phase = 'working';
+      ctx.m.trace = `${payload.name || 'tool'}`;
+    } else if (kind === 'finalizing') {
+      ctx.m.phase = 'finishing';
+    } else if (kind === 'node_end' || kind === 'done') {
+      // The reply text and the real cost both come off the run row, not off
+      // the stream — one authoritative read instead of two half-truths.
+      pollRun(sessionId, runId);
+      return;
+    }
+    if (S.activeSession === ctx.s.id) renderThread();
+  };
+
+  ['llm_token', 'tool_call', 'tool_result', 'finalizing', 'node_end', 'done']
+    .forEach((k) => es.addEventListener(k, onEvent(k)));
+
+  // Do NOT reconnect by hand on error. EventSource reconnects natively, and
+  // the upstream stream route replays every persisted event from the DB on
+  // each connect — so the naive thing is also the lossless thing.
+  es.addEventListener('error', () => { if (!live()) stopWatching(runId); });
+}
+
+async function pollRun(sessionId, runId) {
+  let r;
+  try {
+    r = await api(`runs/${encodeURIComponent(runId)}`);
+  } catch {
+    return; // transient — the interval tries again
+  }
+  let s = S.sessions.find((x) => x.id === sessionId);
+
+  // The CLI has minted the session id: re-key the tab onto it and pull the
+  // real thread, which is now fetchable.
+  if (r.session_id && s && isUnresolved(s.id)) {
+    rekeySession(s, r.session_id);
+    sessionId = r.session_id;
+    renderTabs(); renderChannels(); renderCrumbs();
+  }
+  s = S.sessions.find((x) => x.id === sessionId);
+  if (!s) return;
+
+  if (r.done) { finishRun(s, runId, r); return; }
+  const m = s.messages[s.messages.length - 1];
+  if (m && m.pending && m.run_id === runId && !m.text && r.status === 'running') {
+    m.phase = 'running';
+    if (S.activeSession === s.id) renderThread();
+  }
+}
+
+/** A run ended. Replace the in-flight bubble with the authoritative reply
+    and its real cost, then release the queue. Safe to call twice — the
+    stream and the poll race each other by design. */
+function finishRun(s, runId, r) {
+  stopWatching(runId);
+
+  // The run is over and the platform never minted a session id, so one never
+  // will: this agent does not run through a coding CLI. Record that on the
+  // session so the composer can say so, and — critically — so the queue is
+  // released instead of waiting forever for an id that is not coming.
+  if (!r.session_id && isUnresolved(s.id)) s.no_session = true;
+
+  const m = s.messages[s.messages.length - 1];
+  if (m && m.pending && m.run_id === runId) {
+    Object.assign(m, {
+      pending: false,
+      text: r.text || (r.error ? `The run ended as \`${r.status}\`: ${r.error}` : ''),
+      at: r.ended_at || Date.now() / 1000,
+      status: r.status,
+      cost_usd: r.cost_usd,
+      tokens_in: r.tokens_in,
+      tokens_out: r.tokens_out,
+      model: r.model,
+      error: r.error,
+    });
+    s.cost_usd = Number(s.cost_usd || 0) + Number(r.cost_usd || 0);
+    s.tokens_in = Number(s.tokens_in || 0) + Number(r.tokens_in || 0);
+    s.tokens_out = Number(s.tokens_out || 0) + Number(r.tokens_out || 0);
+    s.run_count = Number(s.run_count || 0) + 1;
+    s.updated_at = r.ended_at || Date.now() / 1000;
+    s.last_status = r.status;
+  }
+
+  const p = PENDING.get(s.id);
+  PENDING.delete(s.id);
+  if (S.activeSession === s.id) renderThread();
+  renderChannels(); renderTabs();
+
+  if (r.status === 'success') toast(`${agentBy(s.agent)?.name ?? s.agent} replied · ${money(r.cost_usd)}`, 'ok');
+  else toast(`Run ended as ${r.status}`, 'warn');
+
+  // Release one queued message. One, not all: each is a turn of its own and
+  // the next can only go out once this session is free again.
+  if (p && p.queue.length) {
+    const next = p.queue.shift();
+    const idx = s.messages.findIndex((x) => x.queued && x.text === next);
+    if (idx >= 0) s.messages.splice(idx, 1);
+    PENDING.delete(s.id);
+    const was = S.activeSession;
+    S.activeSession = s.id;
+    sendMessage(next).finally(() => {
+      const held = PENDING.get(s.id);
+      if (held) held.queue.push(...p.queue);
+      S.activeSession = was;
+    });
+  }
+}
+
+/** Show one run's tool calls, in-DOM under the turn — no native dialogs are
+    available inside the window's iframe. */
+async function showTrace(runId, btn) {
+  const holder = btn.closest('.msg').querySelector('.trace-out');
+  if (holder) { holder.remove(); return; }
+  btn.disabled = true;
+  let events = [];
+  try { events = await api(`runs/${encodeURIComponent(runId)}/events`); } catch (err) {
+    toast(`Could not read the trace: ${err.message}`, 'warn');
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  const calls = events.filter((e) => e.kind === 'tool_call');
+  const out = document.createElement('div');
+  out.className = 'trace-out mono';
+  out.innerHTML = calls.length
+    ? calls.map((e) => `<div>→ ${esc((e.payload || {}).name || 'tool')}</div>`).join('')
+    : '<div>No tool calls on this run.</div>';
+  btn.closest('.msg').querySelector('div').append(out);
 }
 
 /* ================================================================= SYSTEM */
@@ -1077,38 +1487,39 @@ function renderPicker() {
       <span>
         <div style="font-weight:650">${esc(a.name)}</div>
         <div style="font-size:11.5px;color:var(--ink-3)">${esc(modelLabel(a))} · ${esc(a.squad)} · ${esc(a.slug)}</div>
+        ${resumable(a) ? '' : `<div style="font-size:11.5px;color:var(--warn,var(--ink-3));margin-top:3px">
+          This one answers over a plain API call, not a coding CLI — so it leaves no
+          resumable session. Each message will be a standalone run.</div>`}
       </span>`;
   } else {
     foot.hidden = true;
   }
 }
 
+let draftSeq = 0;
+
+/** Open a tab for a new session.
+
+    A CLI session does not exist until a run has created it, so there is
+    nothing to dispatch and nothing to name until the first message. With a
+    kickoff message typed, this dispatches immediately. Without one, it opens
+    a DRAFT tab — real agent, no run, no session id — and the first send is
+    what makes it real. Drafts are never persisted anywhere; closing the tab
+    discards one, which is the right outcome for something that never ran. */
 async function startSession() {
   const slug = S.pickerPick;
   if (!slug) return;
   const first = $('#pickerKickoff').value.trim();
   const a = agentBy(slug);
-  let sess;
-  try {
-    const r = await api('sessions', {
-      method: 'POST',
-      body: JSON.stringify({ agent: slug, first_message: first || null }),
-    });
-    sess = r.session;
-    S.stats = { ...r.stats, needs_you: sysCounts().needs };
-  } catch {
-    // Degrade rather than dead-end: keep the session client-side.
-    sess = {
-      id: `local-${Date.now()}`, agent: slug, group: 'Today', pinned: false,
-      unread: 0, target: null, state: 'open', updated_at: Date.now() / 1000,
-      // you just started it from the gallery, so it is yours by definition
-      source: 'user', origin: null,
-      title: first ? first.slice(0, 58) : `New session · ${a.name}`,
-      messages: first ? [{ role: 'user', text: first, at: Date.now() / 1000 }] : [],
-    };
-    toast('Backend unreachable — session kept locally');
-  }
-  S.sessions = S.sessions.filter((s) => s.id !== sess.id);
+
+  const sess = {
+    id: `draft:${++draftSeq}`, session_id: null, agent: slug,
+    title: first ? first.slice(0, 58) : `New session · ${a.name}`,
+    source: 'user', origin: null, state: 'open', pinned: false, unread: 0,
+    target: null, updated_at: Date.now() / 1000, created_at: Date.now() / 1000,
+    run_count: 0, cost_usd: 0, tokens_in: 0, tokens_out: 0,
+    retired: false, preview: '', messages: [], loaded: true,
+  };
   S.sessions.unshift(sess);
   closeModal('#picker');
   // land on the scope that actually contains what you just made
@@ -1116,7 +1527,49 @@ async function startSession() {
   S.sessionQ = '';
   $('#sessionSearch').value = '';
   openSession(sess.id);
-  toast(`Opened a tab with ${a.name}`, 'ok');
+
+  if (first) {
+    toast(`Dispatching to ${a.name}…`);
+    await sendMessage(first);
+  } else {
+    toast(`Opened a tab with ${a.name} — send a message to start the run`, 'ok');
+  }
+}
+
+/** Persist the app-local archive flag. Pin and archive are this app's own
+    columns: there is no upstream archive route (CliSessionUpdate takes only
+    name/description, and retired_at is the executor's death marker, not a
+    user action). */
+async function setFlag(s, flag, value) {
+  if (isDraft(s.id) || isUnresolved(s.id)) return;   // nothing upstream to key on yet
+  try {
+    await api(`sessions/${encodeURIComponent(s.id)}/${flag}`, {
+      method: 'POST', body: JSON.stringify({ value }),
+    });
+  } catch (err) {
+    toast(`Could not save ${flag}: ${err.message}`, 'warn');
+  }
+}
+
+function unarchive(s) { setFlag(s, 'archive', false); }
+
+async function renameSession(name) {
+  const s = S.sessions.find((x) => x.id === S.activeSession);
+  if (!s || isDraft(s.id) || isUnresolved(s.id)) return;
+  const prev = s.title;
+  s.title = name || prev;
+  renderThread(); renderChannels(); renderTabs(); renderCrumbs();
+  try {
+    const r = await api(`sessions/${encodeURIComponent(s.id)}`, {
+      method: 'PATCH', body: JSON.stringify({ name }),
+    });
+    s.title = r.title || name;
+    toast('Renamed — every consumer of this session sees it', 'ok');
+  } catch (err) {
+    s.title = prev;
+    toast(`Rename failed: ${err.message}`, 'warn');
+  }
+  renderThread(); renderChannels(); renderTabs(); renderCrumbs();
 }
 
 /* ======================================================= COMMAND PALETTE */
@@ -1260,6 +1713,59 @@ async function tick() {
   }
 }
 
+/** Refresh the rail from the live platform.
+
+    This is how a session started somewhere else — Telegram, a dispatch, the
+    CLI — shows up here, so it runs whichever view you are on rather than
+    only on the Sessions tab.
+
+    Two tiers. The default refresh costs the backend ONE upstream call; the
+    authoritative one (`?full=1`) costs a second call that measured ~4.8s on
+    its own, so it runs on first paint and then once a minute rather than
+    every 10s. See sessions.build_rail's docstring for the numbers.
+
+    MERGE, never replace. A wholesale swap would drop the client-only state
+    the rail does not know about: drafts that have never run, a tab mid-turn
+    whose id has not been minted, a loaded transcript, and the in-flight
+    bubble itself. */
+// Starts at 1, not 0: boot() already paid for a full build through
+// /api/bootstrap, so the first poll 10s later should be the cheap one.
+let railTicks = 1;
+const FULL_RAIL_EVERY = 6;   // 6 x RAIL_MS = ~60s
+
+async function refreshRail() {
+  const full = (railTicks++ % FULL_RAIL_EVERY) === 0;
+  let r;
+  try { r = await api(`sessions${full ? '?full=1' : ''}`); } catch { return; }
+
+  const mine = new Map(S.sessions.map((s) => [s.id, s]));
+  const merged = r.sessions.map((fresh) => {
+    const cur = mine.get(fresh.id);
+    if (!cur) return fresh;
+    mine.delete(fresh.id);
+    // Keep the loaded transcript and anything in flight; take the rest.
+    const keep = cur.loaded
+      ? { messages: cur.messages, loaded: true, live_run_id: cur.live_run_id }
+      : {};
+    return { ...cur, ...fresh, ...keep };
+  });
+
+  // Whatever the platform did not list is either client-only (a draft, an
+  // unresolved run) or has fallen off the end of the 100-row window. Keep
+  // the first kind; a tab the user still has open counts as the first kind
+  // too, because closing someone's tab from under them is worse than
+  // carrying a stale row.
+  for (const [id, s] of mine) {
+    if (isDraft(id) || isUnresolved(id) || S.openTabs.includes(id)) merged.push(s);
+  }
+
+  merged.sort((a, b) => b.updated_at - a.updated_at);
+  S.sessions = merged;
+  S.stats = { ...S.stats, sessions_open: merged.filter((s) => s.state === 'open').length };
+  if (S.view === 'sessions') { renderChannels(); renderTabs(); }
+  if (S.view === 'fleet') renderHeroStats();
+}
+
 /* ==================================================================== WIRE */
 
 function wire() {
@@ -1301,11 +1807,37 @@ function wire() {
     const s = S.sessions.find((x) => x.id === S.activeSession);
     if (s) openSheet(s.agent);
   };
+  $('#threadRename').onclick = () => {
+    const s = S.sessions.find((x) => x.id === S.activeSession);
+    if (!s) return;
+    $('#renamerInput').value = s.title || '';
+    openModal('#renamer');
+    $('#renamerInput').focus();
+    $('#renamerInput').select();
+  };
+  $('#renamerClose').onclick = () => closeModal('#renamer');
+  $('#renamerCancel').onclick = () => closeModal('#renamer');
+  $('#renamerSave').onclick = () => {
+    const name = $('#renamerInput').value.trim();
+    closeModal('#renamer');
+    renameSession(name);
+  };
+  $('#renamerInput').onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('#renamerSave').click(); }
+  };
+
+  // Tool traces are rendered inside message bubbles that renderThread()
+  // rebuilds wholesale, so delegate rather than binding per button.
+  $('#msgs').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-trace]');
+    if (btn) showTrace(btn.dataset.trace, btn);
+  });
+
   $('#threadPin').onclick = async () => {
     const s = S.sessions.find((x) => x.id === S.activeSession);
     if (!s) return;
     s.pinned = !s.pinned;
-    try { await api(`sessions/${s.id}/pin`, { method: 'POST' }); } catch { /* local session */ }
+    setFlag(s, 'pin', s.pinned);
     renderThread(); renderChannels();
     toast(s.pinned ? 'Pinned to the top of the list' : 'Unpinned');
   };
@@ -1313,7 +1845,7 @@ function wire() {
     const s = S.sessions.find((x) => x.id === S.activeSession);
     if (!s) return;
     s.state = s.state === 'archived' ? 'open' : 'archived';
-    try { await api(`sessions/${s.id}/archive`, { method: 'POST' }); } catch { /* local session */ }
+    setFlag(s, 'archive', s.state === 'archived');
     const archived = s.state === 'archived';
     toast(archived
       ? 'Archived — tab closed, find it under the Archived tab'
@@ -1474,6 +2006,9 @@ async function boot() {
   paintPulse(S.ticker[0]);
   tick();
   setInterval(tick, 5200);
+  // The rail poll is the acceptance criterion for "a session started from
+  // Telegram appears here within one refresh", so it runs on every view.
+  setInterval(refreshRail, RAIL_MS);
 
   await sleep(260);
   $('#boot').classList.add('is-gone');
