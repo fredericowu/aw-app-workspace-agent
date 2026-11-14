@@ -1,0 +1,137 @@
+name: AI Review
+
+# Thin caller. PR-Agent's advisory review itself now lives in
+# fredericowu/aw-shared-workflows — read that file's header for the fork
+# threat model, why there is no checkout, why `runs_on` defaults to
+# GitHub-hosted, the inference routing, and why `/improve` is on-demand only.
+#
+# This file USED to be that review, ~289 lines of it, and it was the ONLY
+# copy anywhere: AP-MT and aw-workspace never had one. That is what triggered
+# the extraction — PR-Agent should be part of the common block every repo in
+# the rollout gets, not a feature of this repo alone. Behaviour is unchanged:
+# all three jobs (fork-notice, gate, ai-review) and every design comment
+# moved across intact.
+#
+# ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
+# `@v1.8.0` is immutable and never retagged, for the reasons code-review.yml
+# spells out at length (and `release.yml`'s own `app-release.yml@master` is
+# the cautionary precedent sitting in this very repo). Bumps are deliberate,
+# one caller at a time, and this repo is the designated canary.
+#
+# v1.8.0 gives ai-review-reusable.yml the `runs_on` input its sibling has
+# carried since day one. THIS REPO DELIBERATELY PASSES NOTHING: the input
+# defaults to the JSON string `"ubuntu-latest"`, so the default path is
+# byte-compatible with v1.2.0's hardcoded literal, and this canary exists to
+# prove exactly that before the private caller opts into self-hosted. The
+# input is for private callers burning the Free-plan 20-job account-wide
+# hosted concurrency cap; this repo keeps the hosted default.
+#
+# v1.2.0 was the tag that ADDED ai-review-reusable.yml. The intervening tags
+# (v1.3.0 .. v1.7.0) touched the other two workflows only, which is why this
+# pin was under no pressure until now — one `v*` line serves three
+# independent files. This PR still does NOT bump code-review.yml's own pin:
+# tags are immutable, so it is under no pressure either, and moving two
+# things at once would make a canary failure ambiguous.
+#
+# Note the shared repo keeps ONE `v*` tag line for both workflows rather
+# than an `ai-v*` family — the ruleset that enforces tag immutability targets
+# `refs/tags/v*` only, so a second family would be unprotected.
+#
+# ── WHY THIS IS STILL A SEPARATE FILE FROM code-review.yml ────────────────
+# Unchanged, and still by construction rather than by convention. The two
+# workflows' `concurrency` groups must not share a prefix: `concurrency` is
+# evaluated at the WORKFLOW level, before any job-level `if`, which is the
+# exact mechanism behind the 809a1a6 incident where CodeRabbit's auto-comment
+# landed in this workflow's group and cancelled PR-Agent's in-flight run.
+# Merging the two callers into one file would re-open that class of bug.
+#
+# ── THE GROUP KEY BELOW IS LOAD-BEARING ───────────────────────────────────
+# It is not boilerplate and it did not become safe by moving the review into
+# a shared file — the opposite: the `sender.type != 'Bot'` guard that is the
+# OTHER half of this invariant now lives in the shared workflow's `gate` job,
+# in a different repo, while the key stays here (a reusable workflow's own
+# `concurrency` would key on the shared file's identity, collapsing every
+# caller into one queue). The `bot-noop` arm is the 809a1a6 fix: bot senders
+# are keyed into a separate no-op group one layer earlier, where the kill
+# actually happens, while human comment runs stay in the review group so a
+# human `/review` still supersedes an in-flight review.
+#
+# Card 40c5bf3b-9510-810d-a7a2-c67f40939c92. The shared workflow's caller
+# checklist carries this exact string and two tests in that repo assert both
+# halves, precisely because the halves are now in different repos.
+#
+# ── TRIGGERS: `synchronize` IS HERE ───────────────────────────────────────
+# Unlike code-review.yml, which deliberately excludes it. PR-Agent reviews
+# every push by design (the shared workflow sets HANDLE_PUSH_TRIGGER and
+# PUSH_COMMANDS for exactly that), whereas a full deep review costs real
+# subscription budget and is round-driven.
+#
+# ── .pr_agent.toml STAYS ──────────────────────────────────────────────────
+# Not deleted, and not needed either: every load-bearing value is set as a
+# host env var in the shared workflow, which is what makes a change to them
+# testable in the PR that introduces it. PR-Agent reads that file from the
+# DEFAULT BRANCH only, and rejects `[openai] api_base` from a repo file
+# outright. It is kept here as documentation of that asymmetry — new callers
+# in the rollout need no toml at all.
+#
+# ── ONE TRAP, IF YOU ARE EDITING *THIS FILE* IN A PR ──────────────────────
+# `pull_request` runs this file's PR copy, so the PR that introduces this
+# conversion DOES exercise its own `pull_request` path live — expect
+# `devteam/ai-review` to go pending -> success on the PR itself.
+# `issue_comment` (`/review`, `/improve`, `/ask`) ALWAYS runs the DEFAULT
+# BRANCH's copy, so that path cannot be verified until the next PR after
+# merge. Don't burn time "debugging" it.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  issue_comment:
+    types: [created]
+
+# See "THE GROUP KEY BELOW IS LOAD-BEARING" above before touching this.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event.sender.type == 'Bot' && 'bot-noop' || 'review' }}
+  cancel-in-progress: true
+
+jobs:
+  ai-review:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/ai-review-reusable.yml@v1.8.0
+    # Both inputs left at their defaults: `api_base`
+    # (https://agents-platform.aw.tekflox.com/v1), which is the literal this
+    # file carried before the conversion, and `runs_on`, whose default is the
+    # JSON string `"ubuntu-latest"` — see the tag note above for why this
+    # caller passes neither.
+    #
+    # Declared here as well as in the called workflow: the effective
+    # GITHUB_TOKEN permissions are the INTERSECTION of the two, so a scope
+    # omitted on EITHER side is an explicit `none` rather than an inherit and
+    # caps the token to zero. v1.1.1 of the sibling workflow is the worked
+    # example — it granted a scope in every caller, forgot the shared file,
+    # and bought exactly nothing.
+    #
+    # No `checks: read` here, unlike code-review.yml: nothing in this review
+    # reads the Checks API. The gate resolves a fork with
+    # `gh api repos/.../pulls`, and the review publishes COMMIT STATUSES,
+    # which are a different API from check-runs. The shared workflow does not
+    # request the scope either, and its parity test compares the two lists in
+    # both directions — so adding it here would be a test failure, not a
+    # harmless extra.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+    # Passed BY NAME, never `secrets: inherit`. `inherit` does not cross an
+    # ACCOUNT boundary, and when it does not apply it fails SILENTLY with an
+    # empty string rather than an error. Measured on THIS repo, PR #16, on the
+    # sibling workflow: the key IS set here and still arrived empty, because
+    # this repo is `tekflox/*` and the shared workflow is `fredericowu/*`.
+    #
+    # AW_PRAGENT_V1_KEY is already set on this repo (2026-11-01): an
+    # Agents Platform ApiKey bound to the `aw` workspace and scoped to the
+    # `pr-agent-llm` agent alone. The shared workflow reads it with an
+    # explicit fail-loud branch before invoking PR-Agent — new in the
+    # extraction, since a `workflow_call` secret can arrive empty where a
+    # repo secret read directly could not.
+    secrets:
+      AW_PRAGENT_V1_KEY: ${{ secrets.AW_PRAGENT_V1_KEY }}

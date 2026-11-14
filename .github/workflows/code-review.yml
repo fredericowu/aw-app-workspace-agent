@@ -1,0 +1,294 @@
+name: Code Review
+
+# Thin caller. The two-round PR review -> merge loop itself now lives in
+# fredericowu/aw-shared-workflows — read that file's header for the round
+# state machine, the fail-closed `blocks_merge` rule, the RUNNER_TEMP
+# discipline, the trusted-author gate and why the merge uses a PAT and never
+# GITHUB_TOKEN.
+#
+# This file USED to be that loop, ~1100 lines of it, and it was the original:
+# AP-MT copy-adapted it, then aw-workspace core was about to become a third
+# copy. That is what triggered the extraction. The shared workflow is a
+# behaviour-preserving extraction of AP-MT's merged copy (2aab9cd5), which
+# was this file plus fixes; a full non-comment diff of the two confirmed the
+# only differences were the inputs below, two cosmetic banner strings, and
+# the `--auto` note further down.
+#
+# ── WHY AN EXACT TAG, NOT @master ─────────────────────────────────────────
+# `@v1.1.4` is immutable and never retagged. The cautionary precedent is in
+# this very repo: `release.yml` calls
+# `tekflox/aw-marketplace/.../app-release.yml@master`, a deliberately moving
+# ref shared by ~45 app repos, and one fail-loud edit there reddened the whole
+# marketplace at once. Bumps here are deliberate, one caller at a time.
+#
+# This repo is the designated CANARY for those bumps — the oldest and most
+# exercised consumer. A new tag lands here first and is proven on a real PR
+# before the other callers move. It earned that role twice over on its very
+# first use, and BOTH bugs were ones only this repo could have surfaced:
+#
+#   v1.0.1  the merge gate's advisory set had lost `CodeRabbit` (see the
+#           `ci_check_name` note below). Only this repo has that app
+#           installed.
+#   v1.1.0  `secrets: inherit` silently delivered an EMPTY
+#           AW_CODEREVIEW_V1_KEY, because `inherit` does not cross an account
+#           boundary and this repo is `tekflox/*` while the shared workflow
+#           is `fredericowu/*`. The other two callers are same-owner and
+#           inherited fine, so nothing else in the rollout would have caught
+#           it. See the `secrets:` block at the bottom of this file.
+#
+#   v1.1.4  the merge gate could die with NO diagnostic at all. Two defects,
+#           both inherited verbatim from this file's own pre-conversion
+#           ancestor: `gh pr checks` was called with no `timeout=`, so a hung
+#           call blocked the gate step silently; and the job's
+#           `timeout-minutes` equalled the gate's own 20-minute deadline, so
+#           the job was killed before the gate could reach that deadline and
+#           print why it was waiting. Found on AP-MT PR #6, where a round 2
+#           that had PASSED with zero findings sat in that call for 17m53s,
+#           emitted nothing between `##[endgroup]` and `The operation was
+#           canceled`, and cost a full paid review cycle.
+#
+# ── v1.1.3 IS A DUD. NEVER PIN IT. ────────────────────────────────────────
+# It points at the same commit as v1.1.2 and carries none of the fix it was
+# cut for: a quoting error made the `git commit` fail while the `git tag` and
+# both pushes succeeded, so the tag landed on an unchanged HEAD. Content is
+# identical to v1.1.2, so pinning it is misleading rather than broken.
+#
+# It was NOT repaired by re-pointing the tag, because the shared repo's tag
+# ruleset refuses that for everyone including the owner. That is the
+# immutability rule working as designed and costing exactly what it is meant
+# to cost: a burned version number instead of rewritten history under three
+# consumers. The fix shipped as v1.1.4.
+#
+# The practice that would have caught it, now standard: after cutting a tag,
+# verify the TAG'S CONTENT, not just that the push succeeded —
+#   gh api repos/fredericowu/aw-shared-workflows/contents/\
+#     .github/workflows/code-review-reusable.yml?ref=vX.Y.Z -q .content \
+#     | base64 -d | grep <something the release changed>
+#
+# No tag has ever been retagged; all remain published as they were.
+#
+# ── THE LIMIT OF THE CANARY MODEL, FOUND THE HARD WAY ─────────────────────
+# v1.1.1 is the counter-example, and worth keeping in mind before trusting a
+# green run here as proof for everyone. Its bug — a missing `checks: read`
+# making the merge gate read the PR's checks as an empty list — is invisible
+# on a PUBLIC repo, because a public repo's check rollup is readable without
+# the scope. This repo is public. It merged on v1.1.0 first try while the
+# private AP-MT failed four consecutive rounds on identical code.
+#
+# So this canary proves a tag against a public, `tekflox/*`-owned consumer.
+# It cannot prove anything that depends on being private, and the rollout
+# order should treat a private consumer as a second, independent canary
+# rather than as a follower.
+#
+#   v1.1.2  and then v1.1.1's own fix turned out to be inert: it granted
+#           `checks: read` in all three CALLERS and never requested it in
+#           the shared workflow's own `permissions:` block, which caps the
+#           token to the intersection — so the scope was `none` regardless.
+#           Found by the Dev Team reviewer on #17 (the PR that bumped this
+#           file to v1.1.1), by resolving the pinned tag and reading the
+#           dependency rather than the diff in front of it. Worth noting
+#           that neither this canary nor a private consumer would have
+#           caught it by running: on a public repo the gate works either
+#           way, and on a private one it fails identically before and after.
+#           Only reading both sides finds it, which is why v1.1.2 adds a
+#           test that compares the two permission lists.
+#
+#   v1.3.0  the first tag whose CALLER CONTRACT changed, not just its
+#           internals: the `on:` block below grew `synchronize` and a
+#           `workflow_run` trigger, and the concurrency group grew a third
+#           arm. Those must land in the SAME PR as the pin bump — a caller on
+#           v1.3.0 without them still reviews and still merges the easy case,
+#           and silently loses both of the behaviours the release is for.
+#           This canary therefore costs TWO PRs: `workflow_run` only fires
+#           for a trigger definition already on the DEFAULT BRANCH, so the PR
+#           that adds it cannot exercise what it enables.
+#
+#   v1.4.0  adds `provenance-gate`, a new job between `gate` and
+#           `merge-attempt` that is now a hard merge blocker on every PR:
+#           it fails unless a commit carries a well-formed `AW-Run-Id`
+#           trailer (stamped by a `prepare-commit-msg` hook in the Dev
+#           Team's runner containers — a separate, still-in-progress card)
+#           or a human applies the `provenance-exempt` label. No caller-side
+#           change was needed here: it costs no new permission scope (its
+#           `gh api` calls — labels read, a commit status POST, a PR-body
+#           PATCH, issue-comment POST/PATCH — are all covered by scopes this
+#           file already grants) and no new trigger. The one thing THIS
+#           caller did need, done ahead of the bump: the `provenance-exempt`
+#           label created on this repo (`gh label create provenance-exempt
+#           --color 0E8A16 --repo tekflox/aw-app-template`), same as the two
+#           round labels a new caller needs per the shared workflow's own
+#           CALLER CHECKLIST.
+#
+# ── WHAT CHANGED IN BEHAVIOUR, DELIBERATELY ───────────────────────────────
+# One thing, decided and not to be relitigated here: the merge is now a plain
+# `gh pr merge --squash`, where this file previously used `--squash --auto`.
+# `--auto` only pauses for checks that BRANCH PROTECTION marks required, and
+# this repo has none (verified 2026-11-04: the protection API returns
+# "Branch not protected"), so it was never actually waiting on anything. The
+# shared workflow reads this repo's checks explicitly instead — as of v1.3.0
+# in its `merge-attempt` job, which refuses to merge unless `coverage` has
+# reported a pass on the exact head SHA the review cleared. That read is the
+# ONLY thing between a red suite and a squash-merge here. Direct push to
+# master stays available as the break-glass path.
+#
+# ── WHAT DID NOT CHANGE ───────────────────────────────────────────────────
+# `ai-review.yml` is not touched by this change, at all — same as when this
+# file was first added. The two are deliberately SEPARATE workflows rather
+# than jobs in one file: ai-review.yml's `concurrency` is evaluated at the
+# WORKFLOW level, before any job `if`, which is the exact mechanism behind the
+# 809a1a6 incident where CodeRabbit's own auto-comment landed in that group
+# and cancelled PR-Agent's in-flight run. This file's concurrency group below
+# shares no prefix with ai-review's, so that cancellation class stays
+# impossible BY CONSTRUCTION. Keeping the caller a separate file preserves
+# that property exactly.
+#
+# ── THE TRIGGER SURFACE, AND WHY IT GREW IN v1.3.0 ────────────────────────
+# `synchronize` was deliberately absent here for four releases, for a real
+# reason that has NOT gone away: a full deep review (one judge run plus up to
+# 3 research runs) costs real subscription budget, and PR-Agent already
+# reviews every push. "Review every push" was never the ask.
+#
+# What v1.3.0 adds is narrower than that. The shared gate admits a
+# `synchronize` ONLY when the PR already carries one of the fix-cycle labels
+# — `devteam:awaiting-fixes` (round 2) or, since v1.10.0,
+# `devteam:needs-human` — i.e. the coder's fix push, which is precisely the
+# event those rounds were sitting and waiting for. `needs-human` was added
+# because refusing it left the PREVIOUS commit's per-commit
+# `devteam/code-review` pass on display, reading as a green review of a fix
+# nothing had looked at. Anything else is refused after a single label read, before
+# any paid run. So the budget rationale above is preserved in the gate rather
+# than in this trigger list, and the manual step it replaces (`/aw-review`
+# after every fix push) is gone. `/aw-review` itself is untouched and remains
+# the override from any round; `/aw-improve` remains the lighter-weight
+# sibling command. Both are still parsed by the shared gate.
+#
+# `workflow_run` is the other half, and it is what lets the merge stop
+# polling. The shared workflow's `merge-attempt` job re-attempts the merge
+# when THIS repo's own CI finishes, however long that takes — replacing a
+# 20-minute `gh pr checks` loop that gave up at the deadline. `workflows:`
+# takes the CI workflow's `name:` (the string at the top of `test.yml`), NOT
+# its filename and NOT its job id. Rename that workflow and nothing fails
+# loudly; the event simply stops arriving and merges whose CI finishes after
+# the review verdict quietly stop happening.
+#
+# The `|| github.event.workflow_run.head_branch` arm of the concurrency group
+# below is required alongside it: a workflow_run event has neither
+# `pull_request.number` nor `issue.number`, so without it every workflow_run
+# run in this repo collapses into the single group `code-review-` and, with
+# `cancel-in-progress: false`, queues one at a time.
+#
+# ── ONE TRAP, IF YOU ARE EDITING *THIS FILE* IN A PR ──────────────────────
+# `pull_request` runs this file's PR copy (rounds 1 and 2 both see your edits
+# live). `issue_comment` (`/aw-review`) and `workflow_run` BOTH always run the
+# DEFAULT BRANCH's copy. So the PR that introduces this conversion — and any
+# later PR that only bumps the `@vX.Y.Z` pin or edits this trigger list —
+# CANNOT exercise its own comment path or its own workflow_run path. Verify
+# those on the NEXT PR after merge; don't burn time "debugging" them. That is
+# exactly why the v1.3.0 canary is two PRs: this one lands the triggers, the
+# next one proves the event hop.
+
+on:
+  pull_request:
+    # `synchronize` -> automatic round 2, or round needs-human (the coder's
+    # fix push on an escalated PR, since v1.10.0); the shared gate refuses it
+    # on any other round. See the trigger note above.
+    #
+    # `closed` is here only for the shared workflow's merged-event job; its
+    # gate job excludes `closed` explicitly, so a close never dispatches a
+    # review.
+    types: [opened, reopened, ready_for_review, synchronize, closed]
+  issue_comment:
+    types: [created]
+  # This repo's own CI, BY ITS `name:` — `.github/workflows/test.yml` starts
+  # with `name: Test`. Confirm with
+  #   gh api repos/tekflox/aw-app-template/actions/workflows \
+  #     --jq '.workflows[].name'
+  # rather than trusting the filename.
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
+
+# Stays in the caller, not in the reusable workflow, for two reasons: a
+# reusable workflow's own `concurrency` would key on the SHARED file's
+# identity (collapsing unrelated repos into one queue), and this specific
+# group string is load-bearing here — see the ai-review.yml note above.
+concurrency:
+  group: code-review-${{ github.event.pull_request.number || github.event.issue.number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    uses: fredericowu/aw-shared-workflows/.github/workflows/code-review-reusable.yml@v1.11.0
+    with:
+      # test.yml's job id on this repo. Verified against real `gh pr checks`
+      # output (PRs #13-15), not read off the YAML — `ui-lint` is a second job
+      # there and `coverage` is the one that matters.
+      #
+      # That same verification is what found the v1.0.0 bug: this repo's PRs
+      # also carry a `CodeRabbit` check, which this file's own ADVISORY set
+      # listed and the v1.0.0 extraction had dropped (its source was AP-MT,
+      # which has no CodeRabbit). It sits `pending` while CodeRabbit reviews,
+      # so on v1.0.0 the merge gate would have waited on it and then refused
+      # at the 20-minute deadline. Fixed in v1.0.1, pinned above.
+      ci_check_name: coverage
+      # `runs_on` left at its default (`"ubuntu-latest"`), which is what all
+      # three `runs-on:` lines in the pre-conversion file said. Note this
+      # repo's test.yml derives ITS runner from the repo owner
+      # (`startsWith(github.repository, 'tekflox/')`); code-review never did,
+      # and this conversion does not change that.
+      # This repo is the CANARY (card 4175bf3b) for v1.11.0's new agent_slug
+      # input: dispatch code-reviewer-pipeline, the flow-detached twin of
+      # code-reviewer-sonnet, so this CI-only review stops sharing a slug
+      # with a node on the software-engineering Agents Flow. See
+      # fredericowu/aw-shared-workflows's PROVENANCE header note for why.
+      agent_slug: code-reviewer-pipeline
+    # Declared here as well as in the called workflow: for a reusable workflow
+    # the effective GITHUB_TOKEN permissions are the INTERSECTION of the two,
+    # so a scope omitted here cannot be granted by the shared file — AND a
+    # scope omitted THERE cannot be granted by this block either. Both lists
+    # have to name it. An unlisted scope is an explicit `none`, not an
+    # inherit, so either side alone caps the token to zero. v1.1.1 is the
+    # worked example: it added `checks: read` here and forgot the shared
+    # file, which bought exactly nothing. v1.1.2 fixes that side and adds a
+    # test comparing the two lists.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      # Not load-bearing on THIS repo, and listed anyway so all three callers
+      # share one block. The merge gate reads the PR's checks with `gh pr
+      # checks`, which goes through the Checks API; a PRIVATE repo refuses
+      # that read without this scope and returns an empty list rather than an
+      # error, so the gate reports `required check(s) ['coverage'] did not
+      # report a pass ... Saw: []` every round. This repo is public, which is
+      # exactly why it merged first try on v1.1.0 while the private AP-MT
+      # failed four consecutive rounds on identical code. Anything forked
+      # from this template into a private repo inherits that trap otherwise.
+      checks: read
+      # SAME non-load-bearing-here-but-shared-block story as checks: read
+      # above, for a separate, later-discovered scope gap: `gh pr checks`
+      # always embeds checkSuite{workflowRun{...}} in its GraphQL query (gh
+      # v2.97.0), which needs actions: read, not checks: read. Public repos'
+      # rollups are readable without it; the private AP-MT hit a
+      # deterministic GraphQL 403 on every poll for 20 minutes despite green
+      # CI. See fredericowu/aw-shared-workflows#1.
+      actions: read
+    # Passed BY NAME, never `secrets: inherit`. `inherit` does not cross an
+    # ACCOUNT boundary — GitHub: "workflows that call reusable workflows in
+    # the same organization or enterprise can use the `inherit` keyword" —
+    # and when it does not apply it fails SILENTLY, yielding an empty string
+    # rather than an error.
+    #
+    # Measured on THIS repo, PR #16: with `inherit`, AW_CODEREVIEW_V1_KEY
+    # arrived at the shared workflow as an EMPTY STRING even though it IS set
+    # here — because this repo is `tekflox/*` and the shared workflow is
+    # `fredericowu/*`. Named passing is ownership-independent.
+    #
+    # The shared workflow still reads each with an explicit fail-loud branch
+    # for "unset", so a genuinely missing one names itself in CI. All three
+    # are already set on this repo.
+    secrets:
+      AW_CODEREVIEW_V1_KEY: ${{ secrets.AW_CODEREVIEW_V1_KEY }}
+      AW_DEVTEAM_MERGE_TOKEN: ${{ secrets.AW_DEVTEAM_MERGE_TOKEN }}
+      AW_DEVTEAM_EVENT_SECRET: ${{ secrets.AW_DEVTEAM_EVENT_SECRET }}
