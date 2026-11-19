@@ -92,6 +92,21 @@ def _epoch(value: Any) -> float:
         return 0.0
 
 
+#: Public name for the same helper — notifications.py needs it too.
+epoch = _epoch
+
+
+async def fetch_sweep(client: httpx.AsyncClient, base: str, token: str) -> list[dict]:
+    """The one ``GET /api/runs?summary=true&limit=SWEEP_LIMIT`` sweep every
+    rail build is keyed on. Also notifications.py's only input for the flow
+    escalations feed: a ``flow_needs_human`` run is read off this exact same
+    call rather than a second upstream query shaped for that feature alone."""
+    sweep = await ap_client.get_json(
+        client, base, token, "/api/runs", summary="true", limit=SWEEP_LIMIT
+    )
+    return sweep if isinstance(sweep, list) else []
+
+
 def run_prompt(run: dict) -> str:
     """What was said to the agent. ``input`` is a dict on every real run, but
     tolerate a bare string — older rows and ``run_sync`` both exist."""
@@ -315,10 +330,10 @@ async def build_rail(base: str, token: str, store, full: bool = True) -> dict:
     async with httpx.AsyncClient() as client:
         rows, sweep = await asyncio.gather(
             ap_client.get_json(client, base, token, "/api/sessions", limit=SESSION_LIMIT),
-            ap_client.get_json(client, base, token, "/api/runs", summary="true", limit=SWEEP_LIMIT),
+            fetch_sweep(client, base, token),
         )
         rows = rows if isinstance(rows, list) else []
-        by_session = _group_by_session(sweep if isinstance(sweep, list) else [])
+        by_session = _group_by_session(sweep)
 
         # Decide per session whether the sweep is enough, and only then fan
         # out. run_count is authoritative, so this is an exact test.
@@ -419,10 +434,8 @@ async def build_rail_fast(base: str, token: str, store) -> dict:
     """
     cached = store.all_meta()
     async with httpx.AsyncClient() as client:
-        sweep = await ap_client.get_json(
-            client, base, token, "/api/runs", summary="true", limit=SWEEP_LIMIT
-        )
-    by_session = _group_by_session(sweep if isinstance(sweep, list) else [])
+        sweep = await fetch_sweep(client, base, token)
+    by_session = _group_by_session(sweep)
 
     sessions = []
     for sid in set(cached) | set(by_session):

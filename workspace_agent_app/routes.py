@@ -41,6 +41,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import ap_client
+from . import notifications as notifications_mod
 from . import sessions as sessions_mod
 from .store import Store
 
@@ -102,12 +103,42 @@ def build_routes(
         rail = await guarded(sessions_mod.build_rail(base, token, st))
         data["sessions"] = rail["sessions"]
         data["stats"]["sessions_open"] = sum(1 for s in rail["sessions"] if s["state"] == "open")
+        # Same reasoning for System: the bell/badge count has to be real on
+        # first paint, not fill in a few seconds later.
+        notes = await guarded(notifications_mod.build_notifications(base, token))
+        data["notifications"] = notes["notifications"]
+        data["stats"]["needs_you"] = sum(
+            1
+            for n in data["notifications"]
+            if n["state"] == "open" and n["severity"] in ("action", "critical")
+        )
         return data
 
     @app.get("/api/pulse")
     async def pulse() -> dict:
         base, token = creds()
         return await guarded(ap_client.fetch_pulse(base, token))
+
+    # ---- system notifications (card 3/3) -------------------------------
+
+    @app.get("/api/notifications")
+    async def notifications() -> dict:
+        base, token = creds()
+        return await guarded(notifications_mod.build_notifications(base, token))
+
+    @app.post("/api/notifications/{note_id}/reply")
+    async def notification_reply(note_id: str, body: Message) -> dict:
+        """Only an agent QUESTION (``hq:<token>``) can be replied to — a flow
+        escalation has no reply action in v1, it is resolved by working the
+        run/card, not by a text answer."""
+        base, token = creds()
+        kind, _, question_token = note_id.partition(":")
+        if kind != "hq" or not question_token:
+            raise HTTPException(status_code=400, detail="this notice has no reply action")
+        text = body.text.strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="text is required")
+        return await guarded(notifications_mod.answer_question(base, token, question_token, text))
 
     # ---- sessions rail -------------------------------------------------
 

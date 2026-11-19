@@ -18,11 +18,13 @@
    behind the scenes (`source` on the session, `origin` naming the caller).
    Archived and All sit alongside those two.
 
-   Fleet and Sessions are wired to the live Agents Platform over RELATIVE
-   fetch paths ("api/...") — this app's own backend serves the page at its
-   mount root, so those resolve under /api/apps/workspace-agent/api/*.
-   System is a separate card; its endpoints don't exist yet here, so calls
-   into it degrade client-side (see replyTo below).
+   Fleet, Sessions and System are all wired to the live Agents Platform over
+   RELATIVE fetch paths ("api/...") — this app's own backend serves the page
+   at its mount root, so those resolve under /api/apps/workspace-agent/api/*.
+   System's two feeds (agent questions, flow escalations) are read-only past
+   the single inline-reply action: replying to a question is the only write,
+   and it resumes the real asking run server-side — this app cannot observe
+   that resume, only that the platform accepted the answer (see replyTo).
 
    WHAT A SESSION IS HERE — the thing most likely to mislead a reader of this
    file. A session is a real CLI session (the same one Telegram and every
@@ -1256,6 +1258,13 @@ function noteHtml(n) {
   const sev = n.state === 'resolved' ? 'resolved' : n.severity === 'critical' ? 'critical'
     : n.severity === 'warn' ? 'warn' : n.severity === 'info' ? 'info' : 'action';
   const ctx = n.context || {};
+  // Only an agent QUESTION gets a reply box — a flow escalation has no
+  // reply action in v1 (it is resolved by working the run/card, not a
+  // text answer), so it never had a real endpoint to pretend to call.
+  const canReply = n.kind === 'question';
+  const jump = ctx.session
+    ? `<button class="btn btn--ghost btn--sm" data-goto-session="${esc(ctx.session)}">${canReply ? 'Open session →' : 'Open the run →'}</button>`
+    : '';
   return `
     <article class="note note--${sev} ${n.state === 'resolved' ? 'is-resolved' : ''}" data-note="${n.id}">
       <header class="note-head">
@@ -1268,7 +1277,6 @@ function noteHtml(n) {
             <span>from <b style="color:var(--ink-2)">${esc(a?.name ?? n.from_agent)}</b></span>
             <span class="tag tag--mono">${esc(ctx.run ?? 'no run')}</span>
             ${ctx.card ? `<span class="tag tag--mono">card ${esc(ctx.card)}</span>` : ''}
-            ${ctx.target ? `<span class="tag tag--mono">${esc(ctx.target)}</span>` : ''}
             <span style="color:var(--ink-4)">${agoPhrase(n.at)}</span>
           </div>
         </div>
@@ -1285,23 +1293,22 @@ function noteHtml(n) {
             <span>${md(r.text)}</span>
           </div>`).join('')}</div>` : ''}
 
-        ${n.state === 'open' ? `
+        ${canReply && n.state === 'open' ? `
           <div class="note-reply">
             ${n.suggestions?.length ? `<div class="sugg">${n.suggestions.map((s) => `
               <button class="sugg-btn" data-sugg="${esc(s)}">${esc(s)}</button>`).join('')}</div>` : ''}
             <div class="reply-box">
-              <textarea rows="1" data-reply-input placeholder="Reply to ${esc(a?.name ?? 'the agent')} — this goes straight back into the run…" aria-label="Reply"></textarea>
+              <textarea rows="1" data-reply-input placeholder="Reply to ${esc(a?.name ?? 'the agent')} — this resumes the run…" aria-label="Reply"></textarea>
               <button class="btn btn--primary btn--sm" data-send-reply disabled>Send</button>
             </div>
             <div class="note-foot">
               <span class="spacer"></span>
-              <button class="btn btn--ghost btn--sm" data-open-thread="${n.from_agent}">Open a session instead</button>
-              ${n.kind === 'alert' ? '<button class="btn btn--ghost btn--sm" data-ack>Acknowledge only</button>' : ''}
+              ${jump}
             </div>
           </div>` : `
           <div class="note-foot" style="margin-top:12px">
             <span class="spacer"></span>
-            <button class="btn btn--ghost btn--sm" data-reopen>Reopen</button>
+            ${jump}
           </div>`}
       </div>
     </article>`;
@@ -1328,59 +1335,37 @@ function wireNotes(root) {
         ta.value = b.dataset.sugg; sync(); ta.focus();
       });
     }
-    const ack = $('[data-ack]', card);
-    if (ack) ack.onclick = () => replyTo(id, 'Acknowledged.');
-    const reopen = $('[data-reopen]', card);
-    if (reopen) reopen.onclick = () => reopenNote(id);
     $$('[data-goto-agent]', card).forEach((b) => b.onclick = () => {
       closeDrawer(); openSheet(b.dataset.gotoAgent);
     });
-    $$('[data-open-thread]', card).forEach((b) => b.onclick = () => {
-      closeDrawer(); openPicker(b.dataset.openThread);
+    $$('[data-goto-session]', card).forEach((b) => b.onclick = () => {
+      closeDrawer(); openSession(b.dataset.gotoSession);
     });
   });
 }
 
+/** Answer an agent question inline. Posts to the real
+    POST /api/human-questions/{token}/answer alias (proxied), which resumes
+    the asking run server-side with the answer as its next prompt — this app
+    only learns that the platform accepted it, not that the resume actually
+    ran; opening the session (see the "Open session →" jump button once
+    context.session is known) is how you watch that happen. */
 async function replyTo(id, text) {
   const n = S.notifs.find((x) => x.id === id);
-  if (!n || !text.trim()) return;
-  const now = Date.now() / 1000;
-  n.replies.push({ role: 'user', text: text.trim(), at: now });
-  n.state = 'resolved';
-
+  const value = text.trim();
+  if (!n || !value) return;
   try {
-    const r = await api(`notifications/${id}/reply`, {
-      method: 'POST', body: JSON.stringify({ text: text.trim(), resolve: true }),
-    });
-    n.replies = r.notification.replies;
-  } catch {
-    // System isn't wired to a real run yet (separate card) — acknowledge
-    // client-side rather than dead-ending on the missing endpoint.
-    n.replies.push({
-      role: 'agent',
-      at: now + 1,
-      text: {
-        question: 'Got it — proceeding on that. I\'ll report back on the run when it lands.',
-        approval: 'Recorded. Continuing the run with that decision.',
-        alert: 'Acknowledged. I\'ll stop surfacing this unless the trend changes.',
-      }[n.kind],
-    });
+    await api(`notifications/${id}/reply`, { method: 'POST', body: JSON.stringify({ text: value }) });
+  } catch (err) {
+    toast(`Could not send the answer: ${err.message}`, 'err');
+    return;
   }
-  toast('Reply sent back into the run', 'ok');
+  n.replies.push({ role: 'user', text: value, at: Date.now() / 1000 });
+  n.state = 'resolved';
+  toast(`Answer sent — ${agentBy(n.from_agent)?.name ?? n.from_agent} is resuming`, 'ok');
   renderSystem();
   renderDrawer();
   renderHeroStats();
-}
-
-async function reopenNote(id) {
-  const n = S.notifs.find((x) => x.id === id);
-  if (!n) return;
-  n.state = 'open';
-  try { await api(`notifications/${id}/reopen`, { method: 'POST' }); } catch { /* local-only note */ }
-  S.sysFilter = 'needs';
-  renderSystem();
-  renderDrawer();
-  toast('Reopened — it is waiting on you again');
 }
 
 /* ================================================================= DRAWER */
@@ -1598,7 +1583,7 @@ function cmdSources() {
   }));
   S.notifs.filter((n) => n.state === 'open').forEach((n) => items.push({
     kind: 'system', glyph: NOTE_ICON[n.kind], h: 32,
-    main: n.title, sub: `${n.from_agent} · needs an answer`,
+    main: n.title, sub: `${n.from_agent} · ${n.kind === 'question' ? 'needs an answer' : 'needs a human'}`,
     run: () => { S.sysFilter = 'all'; setView('system'); },
   }));
   return items;
@@ -1764,6 +1749,39 @@ async function refreshRail() {
   S.stats = { ...S.stats, sessions_open: merged.filter((s) => s.state === 'open').length };
   if (S.view === 'sessions') { renderChannels(); renderTabs(); }
   if (S.view === 'fleet') renderHeroStats();
+}
+
+const NOTIFY_MS = 15000;   // same cadence class as the rail poll
+
+/** Refresh the System feeds — agent questions + flow escalations — from the
+    live platform. MERGE, never replace, same reasoning as refreshRail: an
+    in-progress reply box must survive a poll landing mid-type.
+
+    `status=all` on the human-questions side means an answered question keeps
+    showing up here (so it stays reachable under the Resolved filter); a flow
+    escalation has no such upstream history, so one that drops out of the
+    sweep because its `flow_needs_human` flag cleared is kept locally, marked
+    resolved, rather than vanishing a card the user may be mid-read on. */
+async function refreshNotifications() {
+  let r;
+  try { r = await api('notifications'); } catch { return; }
+
+  const mine = new Map(S.notifs.map((n) => [n.id, n]));
+  const merged = r.notifications.map((fresh) => {
+    const cur = mine.get(fresh.id);
+    if (!cur) return fresh;
+    mine.delete(fresh.id);
+    return { ...cur, ...fresh };
+  });
+  for (const [id, n] of mine) {
+    if (id.startsWith('esc:')) merged.push({ ...n, state: 'resolved' });
+  }
+
+  merged.sort((a, b) => b.at - a.at);
+  S.notifs = merged;
+  updateBadges();
+  if (S.view === 'system') renderSystem();
+  renderDrawer();
 }
 
 /* ==================================================================== WIRE */
@@ -2009,6 +2027,7 @@ async function boot() {
   // The rail poll is the acceptance criterion for "a session started from
   // Telegram appears here within one refresh", so it runs on every view.
   setInterval(refreshRail, RAIL_MS);
+  setInterval(refreshNotifications, NOTIFY_MS);
 
   await sleep(260);
   $('#boot').classList.add('is-gone');
