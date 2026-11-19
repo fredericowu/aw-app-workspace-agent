@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from workspace_agent_app import ap_client  # noqa: E402
+from workspace_agent_app import notifications as notifications_mod  # noqa: E402
 from workspace_agent_app import sessions as sessions_mod  # noqa: E402
 from workspace_agent_app.routes import build_routes  # noqa: E402
 
@@ -31,6 +32,16 @@ def _stub_rail(monkeypatch, sessions=()):
         return {"sessions": list(sessions), "backfilled": 0}
 
     monkeypatch.setattr(sessions_mod, "build_rail", fake_build_rail)
+
+
+def _stub_notifications(monkeypatch, notes=()):
+    """Same reasoning as ``_stub_rail`` — the System feeds also ship with
+    the first paint."""
+
+    async def fake_build_notifications(base, token):
+        return {"notifications": list(notes)}
+
+    monkeypatch.setattr(notifications_mod, "build_notifications", fake_build_notifications)
 
 
 def test_bootstrap_503s_when_no_credentials_are_configured():
@@ -46,6 +57,7 @@ def test_bootstrap_returns_the_shaped_payload_when_configured(monkeypatch):
 
     monkeypatch.setattr(ap_client, "fetch_bootstrap", fake_fetch_bootstrap)
     _stub_rail(monkeypatch)
+    _stub_notifications(monkeypatch)
     client = TestClient(build_routes(lambda: ("http://ap", "tok")))
     resp = client.get("/api/bootstrap")
     assert resp.status_code == 200
@@ -68,10 +80,34 @@ def test_bootstrap_ships_the_rail_with_the_first_paint(monkeypatch):
             {"id": "s2", "state": "archived"},
         ],
     )
+    _stub_notifications(monkeypatch)
     client = TestClient(build_routes(lambda: ("http://ap", "tok")))
     body = client.get("/api/bootstrap").json()
     assert [s["id"] for s in body["sessions"]] == ["s1", "s2"]
     assert body["stats"]["sessions_open"] == 1
+
+
+def test_bootstrap_ships_the_system_badge_count_with_the_first_paint(monkeypatch):
+    """Same reasoning as the rail: the needs-you badge must be real on first
+    paint, not fill in a few seconds later."""
+
+    async def fake_fetch_bootstrap(base, token):
+        return {"agents": [], "squads": [], "models": {}, "stats": {"agents": 0}}
+
+    monkeypatch.setattr(ap_client, "fetch_bootstrap", fake_fetch_bootstrap)
+    _stub_rail(monkeypatch)
+    _stub_notifications(
+        monkeypatch,
+        [
+            {"id": "hq:t1", "state": "open", "severity": "action"},
+            {"id": "esc:r1", "state": "open", "severity": "critical"},
+            {"id": "hq:t2", "state": "resolved", "severity": "action"},
+        ],
+    )
+    client = TestClient(build_routes(lambda: ("http://ap", "tok")))
+    body = client.get("/api/bootstrap").json()
+    assert len(body["notifications"]) == 3
+    assert body["stats"]["needs_you"] == 2
 
 
 def test_bootstrap_surfaces_a_platform_error_as_502(monkeypatch):

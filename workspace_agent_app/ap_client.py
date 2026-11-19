@@ -256,9 +256,11 @@ def _running_slugs(runs: list[dict]) -> set[str]:
 
 def shape_bootstrap(agents: list[dict], groups: list[dict], runs: list[dict]) -> dict:
     """Map real Agents Platform responses onto the frontend's `S.*` shape
-    (app.js boot()). Sessions/notifications stay empty — those surfaces are
-    separate cards, not yet wired; shipping a fixed roster there would be the
-    exact mock data this build is required to ship none of."""
+    (app.js boot()). `sessions`/`notifications` are filled in by
+    routes.build_routes's own `/api/bootstrap` handler, from the real rail
+    (sessions.py) and the real System feeds (notifications.py) — shipping a
+    fixed roster here instead would be the exact mock data this build is
+    required to ship none of."""
     live_agents = [a for a in agents if not a.get("deleted_at")]
     # /api/runs' source_slug can name a workflow (e.g. a kanban-sweep run),
     # not just an agent — restrict to slugs that are actually in the fleet
