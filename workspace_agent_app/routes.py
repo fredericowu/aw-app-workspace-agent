@@ -105,8 +105,10 @@ def build_routes(
         data["stats"]["sessions_open"] = sum(1 for s in rail["sessions"] if s["state"] == "open")
         # Same reasoning for System: the bell/badge count has to be real on
         # first paint, not fill in a few seconds later.
-        notes = await guarded(notifications_mod.build_notifications(base, token))
-        data["notifications"] = notes["notifications"]
+        notes = await guarded(notifications_mod.build_questions(base, token))
+        data["notifications"] = sorted(
+            notes["notifications"] + _escalations(rail), key=lambda n: n["at"], reverse=True
+        )
         data["stats"]["needs_you"] = sum(
             1
             for n in data["notifications"]
@@ -124,7 +126,7 @@ def build_routes(
     @app.get("/api/notifications")
     async def notifications() -> dict:
         base, token = creds()
-        return await guarded(notifications_mod.build_notifications(base, token))
+        return await guarded(notifications_mod.build_questions(base, token))
 
     @app.post("/api/notifications/{note_id}/reply")
     async def notification_reply(note_id: str, body: Message) -> dict:
@@ -152,7 +154,10 @@ def build_routes(
         carries the measurement that makes the split worth having.
         """
         base, token = creds()
-        return await guarded(sessions_mod.build_rail(base, token, st, full=full))
+        rail = await guarded(sessions_mod.build_rail(base, token, st, full=full))
+        rail["escalations"] = _escalations(rail)
+        rail.pop("flagged_runs", None)
+        return rail
 
     @app.get("/api/sessions/{session_id}/thread")
     async def thread(session_id: str) -> dict:
@@ -242,6 +247,10 @@ def build_routes(
         app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
     return app
+
+
+def _escalations(rail: dict) -> list[dict]:
+    return notifications_mod.escalations(rail.get("flagged_runs") or [])
 
 
 async def _agent_for(base: str, token: str, store: Store, session_id: str) -> str:

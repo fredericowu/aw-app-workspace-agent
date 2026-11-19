@@ -107,6 +107,13 @@ async def fetch_sweep(client: httpx.AsyncClient, base: str, token: str) -> list[
     return sweep if isinstance(sweep, list) else []
 
 
+def flagged_runs(sweep: list[dict]) -> list[dict]:
+    """The sweep's ``flow_needs_human`` runs — the System tab's escalations
+    feed. Riding on the rail's own sweep is what keeps that feed from costing
+    a second ``/api/runs`` call: every rail build already holds this list."""
+    return [r for r in sweep if r.get("flow_needs_human")]
+
+
 def run_prompt(run: dict) -> str:
     """What was said to the agent. ``input`` is a dict on every real run, but
     tolerate a bare string — older rows and ``run_sync`` both exist."""
@@ -405,7 +412,12 @@ async def build_rail(base: str, token: str, store, full: bool = True) -> dict:
         sessions.append(shape_session(row, runs or [], derived, totals_, meta))
 
     sessions.sort(key=lambda s: s["updated_at"], reverse=True)
-    return {"sessions": sessions, "backfilled": len(needs_backfill), "full": True}
+    return {
+        "sessions": sessions,
+        "backfilled": len(needs_backfill),
+        "full": True,
+        "flagged_runs": flagged_runs(sweep),
+    }
 
 
 async def build_rail_fast(base: str, token: str, store) -> dict:
@@ -495,7 +507,12 @@ async def build_rail_fast(base: str, token: str, store) -> dict:
         sessions.append(shape_session(row, runs, derived, totals_, meta))
 
     sessions.sort(key=lambda s: s["updated_at"], reverse=True)
-    return {"sessions": sessions[:SESSION_LIMIT], "backfilled": 0, "full": False}
+    return {
+        "sessions": sessions[:SESSION_LIMIT],
+        "backfilled": 0,
+        "full": False,
+        "flagged_runs": flagged_runs(sweep),
+    }
 
 
 def _persist(

@@ -118,26 +118,72 @@ def test_shape_escalation_falls_back_when_there_is_no_prompt():
     assert n["body"] == "A flow run needs a human decision." and n["from_agent"] == "unknown"
 
 
-def test_build_notifications_merges_both_feeds_newest_first_and_filters_the_sweep(intercept):
-    calls = intercept(
+def test_build_questions_is_one_call_and_never_touches_the_runs_sweep(intercept):
+    calls = intercept({"/api/human-questions": [question(), question(token="t2")]})
+    out = asyncio.run(notes.build_questions("http://ap", "tok"))
+    assert sorted(n["id"] for n in out["notifications"]) == ["hq:t2", "hq:tok1"]
+    assert [c[1] for c in calls] == ["/api/human-questions"]
+    assert "status=all" in calls[0][2]
+
+
+def test_build_questions_tolerates_a_non_list_upstream(intercept):
+    intercept({"/api/human-questions": {"detail": "x"}})
+    assert asyncio.run(notes.build_questions("http://ap", "tok")) == {"notifications": []}
+
+
+def test_escalations_are_shaped_newest_first():
+    out = notes.escalations(
+        [run_row("old", started_at="2026-11-14T10:00:00+00:00"), run_row("new")]
+    )
+    assert [n["id"] for n in out] == ["esc:new", "esc:old"]
+
+
+def test_flagged_runs_filters_the_sweep():
+    from workspace_agent_app import sessions
+
+    assert [r["id"] for r in sessions.flagged_runs([run_row("a"), run_row("b", flagged=False)])] == ["a"]
+
+
+def _runs_sweep_calls(calls):
+    return [c for c in calls if c[1] == "/api/runs" and "limit=1000" in c[2]]
+
+
+def _bootstrap_fakes(intercept):
+    return intercept(
         {
+            "/api/agents": [],
+            "/api/agent-groups": [],
+            "/api/models": [],
+            "/api/sessions": [],
             "/api/human-questions": [question()],
             "/api/runs": [run_row("r9"), run_row("r8", flagged=False)],
         }
     )
-    out = asyncio.run(notes.build_notifications("http://ap", "tok"))
-    assert [n["id"] for n in out["notifications"]] == ["esc:r9", "hq:tok1"]
-    paths = sorted(c[1] for c in calls)
-    assert paths == ["/api/human-questions", "/api/runs"]
-    runs_q = next(c[2] for c in calls if c[1] == "/api/runs")
-    assert "summary=true" in runs_q
-    hq_q = next(c[2] for c in calls if c[1] == "/api/human-questions")
-    assert "status=all" in hq_q
 
 
-def test_build_notifications_tolerates_non_list_upstream(intercept):
-    intercept({"/api/human-questions": {"detail": "x"}, "/api/runs": {"detail": "x"}})
-    assert asyncio.run(notes.build_notifications("http://ap", "tok")) == {"notifications": []}
+def test_bootstrap_makes_exactly_one_runs_sweep_and_still_lists_both_feeds(intercept):
+    """The escalations feed must ride the rail's sweep, not issue its own."""
+    calls = _bootstrap_fakes(intercept)
+    body = client().get("/api/bootstrap").json()
+    assert len(_runs_sweep_calls(calls)) == 1
+    assert sorted(n["id"] for n in body["notifications"]) == ["esc:r9", "hq:tok1"]
+    assert body["stats"]["needs_you"] == 2
+
+
+def test_rail_poll_carries_escalations_without_a_second_sweep(intercept):
+    calls = _bootstrap_fakes(intercept)
+    for url in ("/api/sessions", "/api/sessions?full=1"):
+        calls.clear()
+        body = client().get(url).json()
+        assert [n["id"] for n in body["escalations"]] == ["esc:r9"]
+        assert "flagged_runs" not in body
+        assert len(_runs_sweep_calls(calls)) == 1
+
+
+def test_notifications_poll_makes_no_runs_call_at_all(intercept):
+    calls = _bootstrap_fakes(intercept)
+    client().get("/api/notifications")
+    assert [c[1] for c in calls] == ["/api/human-questions"]
 
 
 def test_answer_question_posts_answer_field_not_text(intercept):
@@ -170,13 +216,13 @@ def test_notifications_route_passes_through_and_502s(monkeypatch):
     async def ok(base, token):
         return {"notifications": [{"id": "hq:t"}]}
 
-    monkeypatch.setattr(notes, "build_notifications", ok)
+    monkeypatch.setattr(notes, "build_questions", ok)
     assert client().get("/api/notifications").json() == {"notifications": [{"id": "hq:t"}]}
 
     async def boom(base, token):
         raise ap_client.APError("down")
 
-    monkeypatch.setattr(notes, "build_notifications", boom)
+    monkeypatch.setattr(notes, "build_questions", boom)
     assert client().get("/api/notifications").status_code == 502
 
 
