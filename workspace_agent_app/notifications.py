@@ -10,9 +10,9 @@ only the HTTP route was missing). Answering one calls that same route's
 answer as its next prompt. This module only proxies both calls; it cannot
 observe the resume happen, only that the platform accepted the answer.
 
-Feed 2 — flow escalations. Runs with ``flow_needs_human`` true, read off the
-SAME sweep ``sessions.fetch_sweep`` already issues for the rail — no second
-upstream query shaped for this feature alone.
+Feed 2 — flow escalations. Runs with ``flow_needs_human`` true, taken from
+the rail's OWN sweep (``sessions.flagged_runs``, carried on every rail
+response) — no second ``/api/runs`` call, in bootstrap or in the polls.
 
 Both feeds map onto one notification:
 ``{id, kind, from_agent, title, body, severity, state, at,
@@ -24,9 +24,7 @@ reply route can tell a question from an alert without a second lookup.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Any
 
 import httpx
 
@@ -121,15 +119,19 @@ def shape_escalation(run: dict) -> dict:
     }
 
 
-async def build_notifications(base: str, token: str) -> dict:
-    """Both feeds, merged newest-first. Two upstream calls, same as a rail
-    build — one per feed, neither repeated for the other."""
+async def build_questions(base: str, token: str) -> dict:
+    """Feed 1 only: one upstream call. Feed 2 (escalations) is NOT fetched
+    here — it rides on the rail's own runs sweep (``sessions.flagged_runs``),
+    so the System tab adds no second ``/api/runs`` call anywhere."""
     async with httpx.AsyncClient() as client:
-        questions, sweep = await asyncio.gather(
-            fetch_human_questions(client, base, token),
-            sessions_mod.fetch_sweep(client, base, token),
-        )
-    notes: list[dict[str, Any]] = [shape_question(q) for q in questions]
-    notes += [shape_escalation(r) for r in sweep if r.get("flow_needs_human")]
+        questions = await fetch_human_questions(client, base, token)
+    notes = [shape_question(q) for q in questions]
     notes.sort(key=lambda n: n["at"], reverse=True)
     return {"notifications": notes}
+
+
+def escalations(flagged: list[dict]) -> list[dict]:
+    """Shape the rail's flagged runs, newest first."""
+    notes = [shape_escalation(r) for r in flagged]
+    notes.sort(key=lambda n: n["at"], reverse=True)
+    return notes

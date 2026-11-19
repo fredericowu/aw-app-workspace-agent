@@ -38,10 +38,10 @@ def _stub_notifications(monkeypatch, notes=()):
     """Same reasoning as ``_stub_rail`` — the System feeds also ship with
     the first paint."""
 
-    async def fake_build_notifications(base, token):
+    async def fake_build_questions(base, token):
         return {"notifications": list(notes)}
 
-    monkeypatch.setattr(notifications_mod, "build_notifications", fake_build_notifications)
+    monkeypatch.setattr(notifications_mod, "build_questions", fake_build_questions)
 
 
 def test_bootstrap_503s_when_no_credentials_are_configured():
@@ -99,9 +99,9 @@ def test_bootstrap_ships_the_system_badge_count_with_the_first_paint(monkeypatch
     _stub_notifications(
         monkeypatch,
         [
-            {"id": "hq:t1", "state": "open", "severity": "action"},
-            {"id": "esc:r1", "state": "open", "severity": "critical"},
-            {"id": "hq:t2", "state": "resolved", "severity": "action"},
+            {"id": "hq:t1", "at": 3, "state": "open", "severity": "action"},
+            {"id": "hq:t3", "at": 2, "state": "open", "severity": "critical"},
+            {"id": "hq:t2", "at": 1, "state": "resolved", "severity": "action"},
         ],
     )
     client = TestClient(build_routes(lambda: ("http://ap", "tok")))

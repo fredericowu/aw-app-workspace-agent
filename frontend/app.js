@@ -1745,6 +1745,7 @@ async function refreshRail() {
   }
 
   merged.sort((a, b) => b.updated_at - a.updated_at);
+  if (r.escalations) mergeNotes(r.escalations, 'esc:');
   S.sessions = merged;
   S.stats = { ...S.stats, sessions_open: merged.filter((s) => s.state === 'open').length };
   if (S.view === 'sessions') { renderChannels(); renderTabs(); }
@@ -1753,35 +1754,34 @@ async function refreshRail() {
 
 const NOTIFY_MS = 15000;   // same cadence class as the rail poll
 
-/** Refresh the System feeds — agent questions + flow escalations — from the
-    live platform. MERGE, never replace, same reasoning as refreshRail: an
-    in-progress reply box must survive a poll landing mid-type.
-
-    `status=all` on the human-questions side means an answered question keeps
-    showing up here (so it stays reachable under the Resolved filter); a flow
-    escalation has no such upstream history, so one that drops out of the
-    sweep because its `flow_needs_human` flag cleared is kept locally, marked
-    resolved, rather than vanishing a card the user may be mid-read on. */
-async function refreshNotifications() {
-  let r;
-  try { r = await api('notifications'); } catch { return; }
-
-  const mine = new Map(S.notifs.map((n) => [n.id, n]));
-  const merged = r.notifications.map((fresh) => {
-    const cur = mine.get(fresh.id);
-    if (!cur) return fresh;
-    mine.delete(fresh.id);
-    return { ...cur, ...fresh };
+/** Fold one feed's fresh notes into S.notifs, leaving the other feed alone.
+    Two feeds, two pollers: questions come from `notifications`, escalations
+    ride on the rail response (same runs sweep — no second /api/runs call).
+    `prefix` names the feed ('hq:' | 'esc:'). */
+function mergeNotes(fresh, prefix) {
+  const mine = new Map(S.notifs.filter((n) => n.id.startsWith(prefix)).map((n) => [n.id, n]));
+  const merged = fresh.map((f) => {
+    const cur = mine.get(f.id);
+    mine.delete(f.id);
+    return cur ? { ...cur, ...f } : f;
   });
-  for (const [id, n] of mine) {
-    if (id.startsWith('esc:')) merged.push({ ...n, state: 'resolved' });
-  }
-
-  merged.sort((a, b) => b.at - a.at);
-  S.notifs = merged;
+  // An escalation that dropped out of the sweep resolved itself (its
+  // `flow_needs_human` flag cleared) — keep it, marked resolved, rather than
+  // vanishing a card the user may be mid-read on.
+  if (prefix === 'esc:') for (const n of mine.values()) merged.push({ ...n, state: 'resolved' });
+  S.notifs = S.notifs.filter((n) => !n.id.startsWith(prefix)).concat(merged)
+    .sort((a, b) => b.at - a.at);
   updateBadges();
   if (S.view === 'system') renderSystem();
   renderDrawer();
+}
+
+/** Agent questions, from the live platform. `status=all` upstream, so an
+    answered question stays reachable under the Resolved filter. */
+async function refreshNotifications() {
+  let r;
+  try { r = await api('notifications'); } catch { return; }
+  mergeNotes(r.notifications, 'hq:');
 }
 
 /* ==================================================================== WIRE */
