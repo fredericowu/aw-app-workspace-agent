@@ -21,7 +21,7 @@ jobs:
     # startup (startup_failure, zero jobs) before ever reaching aw-marketplace.
     permissions:
       contents: write
-    uses: tekflox/aw-marketplace/.github/workflows/app-release.yml@master
+    uses: fredericowu/aw-marketplace/.github/workflows/app-release.yml@master
     with:
       bump: ${{ inputs.bump || '' }}
     # Explicit mapping: secrets: inherit does not cross owners (caller is a personal
