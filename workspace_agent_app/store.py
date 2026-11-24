@@ -393,6 +393,27 @@ class Store:
         )
         return status
 
+    def release_claim(self, qid: str) -> None:
+        """Give a claim back untouched (nothing was sent, no attempt spent)."""
+        if self.db is None:
+            return
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = 'queued', claim = NULL WHERE id = :id "
+            "AND status = 'sending'",
+            {"id": qid},
+        )
+
+    def park_failed(self, qid: str, error: str) -> None:
+        """Mark a message failed without retrying (outcome unknown)."""
+        if self.db is None:
+            return
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = 'failed', error = :error, claim = NULL WHERE id = :id",
+            {"id": qid, "error": error[:500]},
+        )
+
     def reap_stale_claims(self) -> None:
         """Park claims whose worker died before recording an outcome."""
         if self.db is None:

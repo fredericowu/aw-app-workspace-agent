@@ -763,13 +763,34 @@ async def drain_session(base: str, token: str, store, session_id: str) -> dict |
     item = store.claim_head(session_id)
     if item is None:
         return None
+    # The idle check above is a snapshot: another worker may have dispatched
+    # the previous row between it and our claim. Ask again now that we hold
+    # the claim, and give it back untouched if the session is busy.
+    try:
+        busy = await session_busy(base, token, session_id)
+    except Exception:  # noqa: BLE001 — nothing sent yet, so give the claim back
+        store.release_claim(item["id"])
+        raise
+    if busy:
+        store.release_claim(item["id"])
+        return None
     try:
         sent = await dispatch(
             base, token, store, item["agent_slug"], item["body"], session_id=session_id
         )
-    except Exception as exc:  # noqa: BLE001 — any failure must release the claim
+    except ap_client.APUnknownOutcome as exc:
+        # The request may have created a run before we lost the answer.
+        # Re-sending would risk a duplicate turn, so park it visibly.
+        store.park_failed(item["id"], f"outcome unknown, not re-sent: {exc}")
+        log.warning("queued dispatch %s outcome unknown: %s", item["id"][:8], exc)
+        return None
+    except ap_client.APError as exc:  # a clear refusal: nothing was created
         status = store.mark_failed_attempt(item["id"], str(exc))
-        log.warning("queued dispatch %s failed (%s): %s", item["id"][:8], status, exc)
+        log.warning("queued dispatch %s refused (%s): %s", item["id"][:8], status, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 — anything else is ambiguous too
+        store.park_failed(item["id"], f"outcome unknown, not re-sent: {exc}")
+        log.warning("queued dispatch %s failed unexpectedly: %s", item["id"][:8], exc)
         return None
     store.mark_sent(item["id"], sent["run_id"])
     return {"queue_id": item["id"], "run_id": sent["run_id"]}

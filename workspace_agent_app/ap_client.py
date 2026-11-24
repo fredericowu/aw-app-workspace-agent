@@ -109,6 +109,11 @@ class APError(RuntimeError):
     """Raised when the Agents Platform is unreachable or unauthorized."""
 
 
+class APUnknownOutcome(APError):
+    """A write whose result we could not see (timeout, dropped connection).
+    The platform may have accepted it, so it must not be blindly re-sent."""
+
+
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
@@ -156,7 +161,9 @@ async def _write(
             timeout=30.0,
         )
     except httpx.HTTPError as exc:
-        raise APError(f"could not reach the Agents Platform: {exc}") from exc
+        # A timeout or dropped connection AFTER the request left means the
+        # platform may well have created the run: the outcome is unknown.
+        raise APUnknownOutcome(f"could not reach the Agents Platform: {exc}") from exc
     if resp.status_code in (400, 404, 409, 429):
         # The platform's own refusals carry a reason the user needs to read
         # verbatim: an unknown agent slug (404), a QA dedup or budget

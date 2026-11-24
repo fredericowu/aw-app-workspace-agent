@@ -285,6 +285,91 @@ def test_inline_drain_of_our_own_message_returns_a_run_id(platform):
     assert out["run_id"] == "run-1" and "queued" not in out
 
 
+def test_stale_idle_snapshot_does_not_dispatch_the_next_row(monkeypatch, platform):
+    """Two workers: B saw the session idle, then A dispatched row 1. B's claim
+    of row 2 must re-check and hand the claim back instead of sending."""
+    st, _ = make_store()
+    st.enqueue("s1", "qa", "row1")
+    time.sleep(0.01)
+    st.enqueue("s1", "qa", "row2")
+    calls = {"n": 0}
+
+    async def busy(base, token, sid):
+        calls["n"] += 1
+        return calls["n"] == 2          # idle at B's first look, busy after claim
+
+    monkeypatch.setattr(sm, "session_busy", busy)
+    # A already took row1 (sent); B proceeds with a stale idle snapshot.
+    head = st.claim_head("s1")
+    st.mark_sent(head["id"], "run-A")
+    assert run(sm.drain_session("b", "t", st, "s1")) is None
+    assert platform["sent"] == []
+    left = st.queued("s1")
+    assert [(i["body"], i["status"], i["attempts"]) for i in left] == [("row2", "queued", 0)]
+
+
+def test_recheck_failure_releases_the_claim_and_raises(monkeypatch, platform):
+    st, _ = make_store()
+    st.enqueue("s1", "qa", "x")
+    calls = {"n": 0}
+
+    async def busy(base, token, sid):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ap_client.APError("down")
+        return False
+
+    monkeypatch.setattr(sm, "session_busy", busy)
+    with pytest.raises(ap_client.APError):
+        run(sm.drain_session("b", "t", st, "s1"))
+    assert st.queued("s1")[0]["status"] == "queued"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [ap_client.APUnknownOutcome("read timeout"), httpx.HTTPStatusError(
+        "500", request=httpx.Request("POST", "http://x"), response=httpx.Response(500))],
+)
+def test_ambiguous_dispatch_outcome_is_parked_never_retried(monkeypatch, platform, exc):
+    st, _ = make_store()
+    st.enqueue("s1", "qa", "x")
+    attempts = {"n": 0}
+
+    async def dispatch(*a, **k):
+        attempts["n"] += 1
+        raise exc
+
+    monkeypatch.setattr(sm, "dispatch", dispatch)
+    assert run(sm.drain_session("b", "t", st, "s1")) is None
+    assert run(sm.drain_all("b", "t", st)) == 0
+    assert attempts["n"] == 1                        # not re-sent
+    item = st.queued("s1")[0]
+    assert item["status"] == "failed" and "outcome unknown" in item["error"]
+
+
+def test_write_timeout_is_classified_as_unknown_outcome(monkeypatch):
+    class Client:
+        async def request(self, *a, **k):
+            raise httpx.ReadTimeout("slow")
+
+    with pytest.raises(ap_client.APUnknownOutcome):
+        run(ap_client.post_json(Client(), "http://ap", "t", "/api/x", {}))
+
+
+def test_clear_refusal_is_still_retried(platform):
+    st, _ = make_store()
+    st.enqueue("s1", "qa", "x")
+    platform["fail"] = True                          # APError: a pre-run refusal
+    run(sm.drain_session("b", "t", st, "s1"))
+    assert st.queued("s1")[0]["status"] == "queued"
+
+
+def test_release_and_park_without_a_database_are_noops():
+    st = Store(None)
+    st.release_claim("q")
+    st.park_failed("q", "e")
+
+
 def test_failed_dispatch_retries_then_parks_visibly(platform):
     st, _ = make_store()
     st.enqueue("s1", "qa", "x")

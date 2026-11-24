@@ -990,6 +990,9 @@ async function sendMessage(text) {
   renderThread();
   renderChannels();
 
+  const userMsg = s.messages[s.messages.length - 2];
+  const bubble = s.messages[s.messages.length - 1];
+
   // Dispatch WITHOUT a session_id when there is no session to continue: a
   // draft that has never run, or an agent that turned out not to mint one.
   const fresh = isDraft(s.id) || s.no_session;
@@ -1008,12 +1011,13 @@ async function sendMessage(text) {
       // The turn is still running: the server is holding this message and
       // will send it when the session is idle. No run exists yet, so drop the
       // in-flight bubble and show it as queued (cancellable).
-      s.messages.pop();
-      Object.assign(s.messages[s.messages.length - 1], {
-        queued: true, queue_id: r.queue_id, qstatus: 'queued',
-      });
+      s.messages = s.messages.filter((x) => x !== bubble);
+      Object.assign(userMsg, { queued: true, queue_id: r.queue_id, qstatus: 'queued' });
       renderThread();
       toast('Queued — sent when the current turn ends');
+      // The turn may have ended while the request was in flight; then no
+      // finishRun will ever fire for it, so follow the queue from here.
+      if (!PENDING.has(s.id)) followQueue(s);
       return;
     }
     live.run_id = r.run_id;
@@ -1089,8 +1093,9 @@ function attachStream(sessionId, runId) {
   const live = () => {
     const s = S.sessions.find((x) => x.id === sessionId)
       || S.sessions.find((x) => x.session_id === sessionId);
-    const m = s && s.messages[s.messages.length - 1];
-    return m && m.pending && m.run_id === runId ? { s, m } : null;
+    // By run id, not position: a queued bubble can sit after the live reply.
+    const m = s && s.messages.find((x) => x.pending && x.run_id === runId);
+    return m ? { s, m } : null;
   };
 
   const onEvent = (kind) => (ev) => {
@@ -1144,8 +1149,8 @@ async function pollRun(sessionId, runId) {
   if (!s) return;
 
   if (r.done) { finishRun(s, runId, r); return; }
-  const m = s.messages[s.messages.length - 1];
-  if (m && m.pending && m.run_id === runId && !m.text && r.status === 'running') {
+  const m = s.messages.find((x) => x.pending && x.run_id === runId);
+  if (m && !m.text && r.status === 'running') {
     m.phase = 'running';
     if (S.activeSession === s.id) renderThread();
   }
