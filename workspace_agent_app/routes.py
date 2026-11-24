@@ -179,15 +179,25 @@ def build_routes(
     async def send_message(session_id: str, body: Message) -> dict:
         """Continue an EXISTING session — the same dispatch endpoint, with
         ``session_id`` set, which is exactly how the Telegram agent resumes
-        a session."""
+        a session. While a turn is running the message is queued server-side
+        (``{"queued": true, "queue_id": ...}``) and sent when the session is
+        idle, with or without a browser open."""
         base, token = creds()
         text = body.text.strip()
         if not text:
             raise HTTPException(status_code=400, detail="text is required")
         agent = await guarded(_agent_for(base, token, st, session_id))
         return await guarded(
-            sessions_mod.dispatch(base, token, st, agent, text, session_id=session_id)
+            sessions_mod.send_or_queue(base, token, st, agent, text, session_id)
         )
+
+    @app.delete("/api/sessions/{session_id}/queue/{queue_id}")
+    async def cancel_queued(session_id: str, queue_id: str) -> dict:
+        """Withdraw a queued message before it is sent. 409 once it has
+        already been dispatched — it is a real run by then."""
+        if not st.cancel(session_id, queue_id):
+            raise HTTPException(status_code=409, detail="that message was already sent")
+        return {"cancelled": True}
 
     @app.patch("/api/sessions/{session_id}")
     async def rename_session(session_id: str, body: Rename) -> dict:

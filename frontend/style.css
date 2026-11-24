@@ -1035,3 +1035,6 @@ kbd {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+.msg--queued { opacity: .72; }
+.msg--queued .msg-text { font-style: italic; }
