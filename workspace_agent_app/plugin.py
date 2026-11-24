@@ -22,13 +22,18 @@ a second worker process could disagree with.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from . import ap_client
 from . import routes as routes_mod
+from . import sessions as sessions_mod
 from .store import Store
 
 log = logging.getLogger("aw_apps.workspace_agent")
+
+#: How often each worker looks for queued messages whose session went idle.
+DRAIN_INTERVAL_S = 5.0
 
 
 class WorkspaceAgentPlugin:
@@ -56,8 +61,24 @@ class WorkspaceAgentPlugin:
         store = Store(ctx.db)
         store.ensure_tables()
         ctx.routes.register(routes_mod.build_routes(_resolve_config, store))
+        # Queued messages are sent by the backend, not by whichever tab is
+        # open. Every worker runs this loop; Store.claim_head makes that safe.
+        self._drain_task = asyncio.create_task(self._drain_loop(_resolve_config, store))
 
         log.info("aw-app-workspace-agent activated: routes mounted, tables ensured")
 
+    async def _drain_loop(self, resolve, store) -> None:
+        while True:
+            try:
+                base, token = resolve()
+                if base and token:
+                    await sessions_mod.drain_all(base, token, store)
+            except Exception:  # noqa: BLE001 — the loop must outlive any one failure
+                log.warning("queue drain pass failed", exc_info=True)
+            await asyncio.sleep(DRAIN_INTERVAL_S)
+
     async def deactivate(self) -> None:
+        task = getattr(self, "_drain_task", None)
+        if task:
+            task.cancel()
         log.info("aw-app-workspace-agent deactivated")

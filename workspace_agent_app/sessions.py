@@ -668,6 +668,7 @@ async def build_thread(base: str, token: str, store, session_id: str) -> dict:
         (r for r in reversed(runs) if (r.get("status") or "") not in TERMINAL_STATUSES), None
     )
     session["live_run_id"] = live.get("id") if live else None
+    session["queued"] = shape_queue(store.queued(session_id))
     return {"session": session}
 
 
@@ -703,6 +704,124 @@ async def dispatch(
         except Exception:  # noqa: BLE001 — losing the marker costs a bucket, not the run
             log.warning("could not record dispatch %s", run_id, exc_info=True)
     return {"run_id": run_id, "session_id": session_id, "status": "pending"}
+
+
+async def session_busy(base: str, token: str, session_id: str) -> bool:
+    """Is a turn of this session still running (or waiting on its lock)?
+
+    Asked of the platform, not inferred from local state: the turn may belong
+    to Telegram or another agent, and only the run rows know.
+    """
+    async with httpx.AsyncClient() as client:
+        runs = await ap_client.get_json(
+            client,
+            base,
+            token,
+            "/api/runs",
+            session_id=session_id,
+            summary="true",
+            limit=10,
+        )
+    runs = runs if isinstance(runs, list) else []
+    return any((r.get("status") or "pending") not in TERMINAL_STATUSES for r in runs)
+
+
+async def send_or_queue(
+    base: str, token: str, store, agent_slug: str, text: str, session_id: str
+) -> dict:
+    """Continue a session — now if it is idle, otherwise durably queue.
+
+    A message is queued server-side whenever the session is mid-turn OR
+    already has queued messages (so order is kept). The platform would also
+    serialise a resume behind its per-session lock, but that lock has a
+    30-minute safety valve that lets a waiter through unserialised, and it
+    does not hand out in queue order; holding the message here until the
+    session is genuinely idle avoids both. Without a database (standalone)
+    there is nothing to hold it in, so it dispatches straight away and
+    leaves ordering to the platform.
+    """
+    if store.db is None:
+        return await dispatch(base, token, store, agent_slug, text, session_id=session_id)
+    if not store.queued(session_id) and not await session_busy(base, token, session_id):
+        return await dispatch(base, token, store, agent_slug, text, session_id=session_id)
+    qid = store.enqueue(session_id, agent_slug, text)
+    sent = await drain_session(base, token, store, session_id)
+    if sent and sent["queue_id"] == qid:
+        return {"run_id": sent["run_id"], "session_id": session_id, "status": "pending"}
+    return {"queued": True, "queue_id": qid, "session_id": session_id, "status": "queued"}
+
+
+async def drain_session(base: str, token: str, store, session_id: str) -> dict | None:
+    """Dispatch the head of one session's queue if the session is idle.
+
+    Returns ``{"queue_id", "run_id"}`` for what was sent, else None. One
+    message per call: each is a turn of its own, and the next can only go once
+    this one's run has ended and the session is idle again.
+    """
+    if not store.queued(session_id) or await session_busy(base, token, session_id):
+        return None
+    item = store.claim_head(session_id)
+    if item is None:
+        return None
+    # The idle check above is a snapshot: another worker may have dispatched
+    # the previous row between it and our claim. Ask again now that we hold
+    # the claim, and give it back untouched if the session is busy.
+    try:
+        busy = await session_busy(base, token, session_id)
+    except Exception:  # noqa: BLE001 — nothing sent yet, so give the claim back
+        store.release_claim(item["id"])
+        raise
+    if busy:
+        store.release_claim(item["id"])
+        return None
+    try:
+        sent = await dispatch(
+            base, token, store, item["agent_slug"], item["body"], session_id=session_id
+        )
+    except ap_client.APUnknownOutcome as exc:
+        # The request may have created a run before we lost the answer.
+        # Re-sending would risk a duplicate turn, so park it visibly.
+        store.park_failed(item["id"], f"outcome unknown, not re-sent: {exc}")
+        log.warning("queued dispatch %s outcome unknown: %s", item["id"][:8], exc)
+        return None
+    except ap_client.APError as exc:  # a clear refusal: nothing was created
+        status = store.mark_failed_attempt(item["id"], str(exc))
+        log.warning("queued dispatch %s refused (%s): %s", item["id"][:8], status, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 — anything else is ambiguous too
+        store.park_failed(item["id"], f"outcome unknown, not re-sent: {exc}")
+        log.warning("queued dispatch %s failed unexpectedly: %s", item["id"][:8], exc)
+        return None
+    store.mark_sent(item["id"], sent["run_id"])
+    return {"queue_id": item["id"], "run_id": sent["run_id"]}
+
+
+async def drain_all(base: str, token: str, store) -> int:
+    """One pass of the background drain: every session with something waiting.
+    Returns how many messages were dispatched."""
+    store.reap_stale_claims()
+    sent = 0
+    for sid in store.sessions_with_queue():
+        try:
+            if await drain_session(base, token, store, sid):
+                sent += 1
+        except (ap_client.APError, httpx.HTTPError) as exc:
+            log.warning("queue drain skipped session %s: %s", sid[:8], exc)
+    return sent
+
+
+def shape_queue(items: list[dict]) -> list[dict]:
+    """Queue rows as the thread view shows them."""
+    return [
+        {
+            "queue_id": i["id"],
+            "text": i["body"],
+            "at": i["created_at"],
+            "status": i["status"],
+            "error": i.get("error") or None,
+        }
+        for i in items
+    ]
 
 
 async def run_status(base: str, token: str, store, run_id: str) -> dict:

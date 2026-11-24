@@ -227,6 +227,38 @@ hiding the line: a visible zero is information, while an absent line makes a
 free turn and an expensive one look identical. Sub-cent costs are never
 rounded to `$0.00`.
 
+## Messages sent while a turn is running (durable queue)
+
+`POST /api/sessions/{id}/messages` asks the platform whether the session has a
+non-terminal run. Idle: dispatch immediately. Busy (or the session already has
+queued messages, to keep order): the message is stored in `app_queue` and the
+response is `{"queued": true, "queue_id": ...}`.
+
+This used to be a JS array in the browser (`PENDING[..].queue`): the agent saw
+nothing until the whole turn ended, a reload lost the message silently, and the
+bubble looked sent. Now:
+
+- A drain loop in the plugin (every 5s, in every worker) sends the oldest
+  queued message of each idle session via the normal `POST /api/agents/{slug}/run`
+  with `session_id`. No tab needs to be open.
+- Workers claim a row with a conditional `UPDATE ... WHERE status='queued'` and
+  read back who won, so N workers never double-send. A claim whose worker died
+  is parked `failed` after 120s (at-most-once: a visible failure beats a
+  duplicate turn). A failing dispatch retries 3 times, then parks `failed`.
+- The thread carries `queued[]`, so a reload shows the message with a cancel
+  button. `DELETE /api/sessions/{id}/queue/{queue_id}` withdraws it (409 once sent).
+
+Why not dispatch immediately and let the platform queue it? AP-MT *does*
+serialise a resume behind a per-session Redis lock (status `queued`, no fork),
+but the lock has a 1800s safety valve after which the waiter runs unserialised,
+and it does not hand out the lease in arrival order. A 30+ minute QA turn plus
+two queued messages would risk a fork or reordering, so the app holds them until
+the session is genuinely idle. Standalone mode (no database) has nowhere to hold
+a message and dispatches straight away.
+
+Still client-side: a message sent while a *new* session's id is not minted yet
+(`run:<id>`), which lasts seconds and has no session to attach a server row to.
+
 ## What this makes harder later
 
 - `session_meta` is a second store. If the platform grows native archive

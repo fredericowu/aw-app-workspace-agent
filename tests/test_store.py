@@ -64,7 +64,7 @@ def test_both_table_names_carry_the_enforced_app_prefix():
 def test_ensure_tables_creates_both():
     db = FakeDb()
     Store(db).ensure_tables()
-    assert [n for n, _ in db.created] == [SESSION_META, APP_DISPATCH]
+    assert [n for n, _ in db.created] == [SESSION_META, APP_DISPATCH, store_mod.APP_QUEUE]
     cols = dict(db.created)
     assert "session_id        TEXT PRIMARY KEY" in cols[SESSION_META]
     assert "run_id      TEXT PRIMARY KEY" in cols[APP_DISPATCH]

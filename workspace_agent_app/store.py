@@ -38,6 +38,12 @@ A cost snapshot being valid says nothing about whether the root-derived
 columns are, which is why those two groups are tracked separately rather
 than behind one "is this row fresh" flag.
 
+``app_queue`` — messages sent to a session whose turn was still running. The
+queue is server-side and durable on purpose: it used to live in the browser's
+memory, which meant the agent saw nothing until the whole turn ended and a
+reload lost the message silently. ``sessions.drain_*`` dispatches the head of
+each session's queue once that session is idle, whether or not any tab is open.
+
 ``app_dispatch`` — one row per run THIS app dispatched, so a session the user
 started here can be bucketed as "User" rather than falling through the
 initiator-kind heuristic to "Agents". ``session_id`` starts NULL (the CLI
@@ -48,12 +54,28 @@ backfilled by the run poll.
 from __future__ import annotations
 
 import logging
+import time
+import uuid
 from typing import Any
 
 log = logging.getLogger("aw_apps.workspace_agent.store")
 
 SESSION_META = "app__workspace-agent__session_meta"
 APP_DISPATCH = "app__workspace-agent__app_dispatch"
+APP_QUEUE = "app__workspace-agent__app_queue"
+
+#: A message that fails to dispatch this many times is parked as ``failed``
+#: (visible and dismissable in the thread) instead of retrying forever.
+MAX_ATTEMPTS = 3
+
+#: A claim older than this is a worker that died between claiming and
+#: recording the outcome. The dispatch may or may not have reached the
+#: platform, so it is parked as ``failed`` rather than re-sent: at-most-once
+#: beats a duplicate turn the user did not ask for.
+CLAIM_STALE_S = 120.0
+
+#: Statuses the thread shows: waiting, being sent right now, or failed.
+_OPEN_STATUSES = ("queued", "sending", "failed")
 
 _SESSION_META_COLUMNS = """
     session_id        TEXT PRIMARY KEY,
@@ -82,6 +104,32 @@ _APP_DISPATCH_COLUMNS = """
     agent_slug  TEXT NOT NULL,
     session_id  TEXT
 """
+
+_APP_QUEUE_COLUMNS = """
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    agent_slug  TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    created_at  DOUBLE PRECISION NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'queued',
+    claim       TEXT,
+    claimed_at  DOUBLE PRECISION,
+    run_id      TEXT,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    error       TEXT
+"""
+
+_QUEUE_FIELDS = (
+    "id",
+    "session_id",
+    "agent_slug",
+    "body",
+    "created_at",
+    "status",
+    "run_id",
+    "attempts",
+    "error",
+)
 
 _META_FIELDS = (
     "agent_slug",
@@ -143,9 +191,11 @@ class Store:
             return
         self.db.create(SESSION_META, _SESSION_META_COLUMNS)
         self.db.create(APP_DISPATCH, _APP_DISPATCH_COLUMNS)
+        self.db.create(APP_QUEUE, _APP_QUEUE_COLUMNS)
         for name, columns_sql in (
             (SESSION_META, _SESSION_META_COLUMNS),
             (APP_DISPATCH, _APP_DISPATCH_COLUMNS),
+            (APP_QUEUE, _APP_QUEUE_COLUMNS),
         ):
             for line in columns_sql.strip().splitlines():
                 col = line.strip().rstrip(",")
@@ -237,3 +287,154 @@ class Store:
             {"run_id": run_id, "session_id": session_id},
         )
         self.upsert_meta(session_id, bucket="user", created_from="app")
+
+    # ---- app_queue ----------------------------------------------------
+
+    def enqueue(self, session_id: str, agent_slug: str, body: str) -> str:
+        """Durably hold a message for a session that is mid-turn."""
+        qid = uuid.uuid4().hex
+        if self.db is None:
+            return qid
+        self.db.execute(
+            APP_QUEUE,
+            "INSERT INTO {table} (id, session_id, agent_slug, body, created_at) "
+            "VALUES (:id, :session_id, :agent_slug, :body, :created_at)",
+            {
+                "id": qid,
+                "session_id": session_id,
+                "agent_slug": agent_slug,
+                "body": body,
+                "created_at": time.time(),
+            },
+        )
+        return qid
+
+    def queued(self, session_id: str) -> list[dict]:
+        """A session's waiting / sending / failed messages, oldest first."""
+        if self.db is None:
+            return []
+        cols = ", ".join(_QUEUE_FIELDS)
+        rows = self.db.execute(
+            APP_QUEUE,
+            f"SELECT {cols} FROM {{table}} WHERE session_id = :session_id "
+            "AND status IN ('queued', 'sending', 'failed') ORDER BY created_at, id",
+            {"session_id": session_id},
+        )
+        return [dict(zip(_QUEUE_FIELDS, r)) for r in rows]
+
+    def sessions_with_queue(self) -> list[str]:
+        """Sessions that have something waiting to be dispatched."""
+        if self.db is None:
+            return []
+        rows = self.db.execute(
+            APP_QUEUE,
+            "SELECT DISTINCT session_id FROM {table} WHERE status IN ('queued', 'sending')",
+        )
+        return [r[0] for r in rows]
+
+    def claim_head(self, session_id: str) -> dict | None:
+        """Atomically take the oldest waiting message, or None.
+
+        None when nothing is waiting, or when another worker already holds a
+        claim on this session (``sending``) — one message per session at a
+        time, which is what keeps order and prevents a double dispatch when
+        several workers run the drain loop. The claim is a conditional UPDATE
+        followed by a read of who won, because the facade does not report an
+        affected-row count.
+        """
+        if self.db is None:
+            return None
+        items = self.queued(session_id)
+        if not items or any(i["status"] == "sending" for i in items):
+            return None
+        head = next((i for i in items if i["status"] == "queued"), None)
+        if head is None:
+            return None
+        token = uuid.uuid4().hex
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = 'sending', claim = :claim, claimed_at = :now "
+            "WHERE id = :id AND status = 'queued'",
+            {"claim": token, "now": time.time(), "id": head["id"]},
+        )
+        rows = self.db.execute(
+            APP_QUEUE,
+            "SELECT claim FROM {table} WHERE id = :id",
+            {"id": head["id"]},
+        )
+        if not rows or rows[0][0] != token:
+            return None
+        return head
+
+    def mark_sent(self, qid: str, run_id: str) -> None:
+        if self.db is None:
+            return
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = 'sent', run_id = :run_id WHERE id = :id",
+            {"id": qid, "run_id": run_id},
+        )
+
+    def mark_failed_attempt(self, qid: str, error: str) -> str:
+        """A dispatch failed. Back to ``queued`` for another try, or parked as
+        ``failed`` once MAX_ATTEMPTS is reached. Returns the new status."""
+        if self.db is None:
+            return "failed"
+        rows = self.db.execute(
+            APP_QUEUE, "SELECT attempts FROM {table} WHERE id = :id", {"id": qid}
+        )
+        attempts = int(rows[0][0] or 0) + 1 if rows else MAX_ATTEMPTS
+        status = "failed" if attempts >= MAX_ATTEMPTS else "queued"
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = :status, attempts = :attempts, error = :error, "
+            "claim = NULL WHERE id = :id",
+            {"id": qid, "status": status, "attempts": attempts, "error": error[:500]},
+        )
+        return status
+
+    def release_claim(self, qid: str) -> None:
+        """Give a claim back untouched (nothing was sent, no attempt spent)."""
+        if self.db is None:
+            return
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = 'queued', claim = NULL WHERE id = :id "
+            "AND status = 'sending'",
+            {"id": qid},
+        )
+
+    def park_failed(self, qid: str, error: str) -> None:
+        """Mark a message failed without retrying (outcome unknown)."""
+        if self.db is None:
+            return
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = 'failed', error = :error, claim = NULL WHERE id = :id",
+            {"id": qid, "error": error[:500]},
+        )
+
+    def reap_stale_claims(self) -> None:
+        """Park claims whose worker died before recording an outcome."""
+        if self.db is None:
+            return
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = 'failed', "
+            "error = 'worker stopped mid-dispatch; not re-sent to avoid a duplicate turn' "
+            "WHERE status = 'sending' AND claimed_at < :cutoff",
+            {"cutoff": time.time() - CLAIM_STALE_S},
+        )
+
+    def cancel(self, session_id: str, qid: str) -> bool:
+        """Drop a waiting (or failed) message. False if it already went out."""
+        if self.db is None:
+            return False
+        self.db.execute(
+            APP_QUEUE,
+            "UPDATE {table} SET status = 'cancelled' WHERE id = :id "
+            "AND session_id = :session_id AND status IN ('queued', 'failed')",
+            {"id": qid, "session_id": session_id},
+        )
+        rows = self.db.execute(APP_QUEUE, "SELECT status FROM {table} WHERE id = :id", {"id": qid})
+        return bool(rows) and rows[0][0] == "cancelled"

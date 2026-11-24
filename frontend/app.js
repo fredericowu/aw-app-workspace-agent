@@ -607,7 +607,9 @@ function sendState(s) {
   if (p && isUnresolved(s.id)) {
     return { ok: 'queue', why: 'Waiting for the CLI to mint this session id — your next message is queued until it does.' };
   }
-  if (p) return { ok: 'queue', why: 'A turn is still running — your next message is queued until it finishes.' };
+  // A running turn on a resolved session is NOT held here: the server queues
+  // the message durably and sends it once the turn ends, tab open or not.
+  if (p) return { ok: true, why: 'A turn is still running — your message is queued on the server and sent when it ends.' };
   return { ok: true, why: '' };
 }
 
@@ -764,11 +766,16 @@ async function loadThread(id) {
   try {
     const r = await api(`sessions/${encodeURIComponent(id)}/thread`);
     Object.assign(s, r.session, { loading: false, unread: 0 });
+    // Messages the server is holding for this session (sent while a turn was
+    // running) — rehydrated here so a reload shows them instead of losing them.
+    s.messages = s.messages.concat((r.session.queued || []).map(queuedMessage));
     // A session can be mid-turn when you open it — somebody else's dispatch,
     // or your own from before a reload. Pick the stream back up.
     if (r.session.live_run_id) {
       PENDING.set(id, { runId: r.session.live_run_id, queue: pendingOf(id)?.queue || [] });
       watchRun(id, r.session.live_run_id);
+    } else {
+      followQueue(s);
     }
   } catch (err) {
     s.loading = false;
@@ -889,17 +896,63 @@ function msgHtml(m, a) {
         </div>
       </div>`;
   }
+  const hold = m.queued ? `
+        <div class="turn-meta mono"><span class="${m.qstatus === 'failed' ? 'turn-bad' : ''}">${
+          m.qstatus === 'failed'
+            ? `Not sent: ${esc(m.error || 'dispatch failed')}`
+            : 'Queued — will be sent when the current turn ends'}</span>
+          <button class="turn-trace" data-cancel-queue="${esc(m.queue_id || '')}">${
+            m.qstatus === 'failed' ? 'dismiss' : 'cancel'}</button></div>` : '';
   return `
-    <div class="msg msg--${mine ? 'user' : 'agent'}" style="--h:${hueOf(a)}"
+    <div class="msg msg--${mine ? 'user' : 'agent'}${m.queued ? ' msg--queued' : ''}" style="--h:${hueOf(a)}"
          data-run="${esc(m.run_id || '')}">
       <span class="msg-av" aria-hidden="true">${mine ? 'F' : (a?.glyph ?? '◆')}</span>
       <div>
         <div class="msg-who">${mine ? 'You' : esc(a?.name ?? 'Agent')}
           <span class="mono">${clock(m.at)}</span></div>
         <div class="msg-text">${md(m.text) || '<span class="mono">(no reply text)</span>'}</div>
-        ${turnMeta(m)}
+        ${hold}${turnMeta(m)}
       </div>
     </div>`;
+}
+
+/** A server-held message, shaped like a thread message. */
+function queuedMessage(q) {
+  return {
+    role: 'user', text: q.text, at: q.at, queued: true,
+    queue_id: q.queue_id, qstatus: q.status, error: q.error,
+  };
+}
+
+/** After a turn ends, the server sends the next queued message on its own
+    (within a few seconds). Reload the thread until it has, so the new run's
+    stream is picked up — the queue itself never depends on this tab. */
+async function followQueue(s) {
+  const waiting = () => s.messages.some((m) => m.queued && m.qstatus !== 'failed');
+  if (s.following || !waiting()) return;
+  s.following = true;
+  try {
+    for (let i = 0; i < 40 && waiting(); i++) {
+      await sleep(3000);
+      s.loaded = false;
+      await loadThread(s.id);
+      if (PENDING.has(s.id)) break;   // loadThread re-attached to the live run
+    }
+  } finally { s.following = false; }
+}
+
+async function cancelQueued(queueId) {
+  const s = S.sessions.find((x) => x.id === S.activeSession);
+  if (!s) return;
+  try {
+    await api(`sessions/${encodeURIComponent(s.id)}/queue/${encodeURIComponent(queueId)}`, { method: 'DELETE' });
+    s.messages = s.messages.filter((m) => m.queue_id !== queueId);
+    toast('Queued message cancelled');
+  } catch (err) {
+    toast('It was already sent — cancel the run instead', 'warn');
+    s.loaded = false; loadThread(s.id);
+  }
+  renderThread();
 }
 
 /** Send a message — i.e. dispatch a real agent run.
@@ -937,6 +990,9 @@ async function sendMessage(text) {
   renderThread();
   renderChannels();
 
+  const userMsg = s.messages[s.messages.length - 2];
+  const bubble = s.messages[s.messages.length - 1];
+
   // Dispatch WITHOUT a session_id when there is no session to continue: a
   // draft that has never run, or an agent that turned out not to mint one.
   const fresh = isDraft(s.id) || s.no_session;
@@ -951,6 +1007,19 @@ async function sendMessage(text) {
       });
 
     const live = s.messages[s.messages.length - 1];
+    if (r.queued) {
+      // The turn is still running: the server is holding this message and
+      // will send it when the session is idle. No run exists yet, so drop the
+      // in-flight bubble and show it as queued (cancellable).
+      s.messages = s.messages.filter((x) => x !== bubble);
+      Object.assign(userMsg, { queued: true, queue_id: r.queue_id, qstatus: 'queued' });
+      renderThread();
+      toast('Queued — sent when the current turn ends');
+      // The turn may have ended while the request was in flight; then no
+      // finishRun will ever fire for it, so follow the queue from here.
+      if (!PENDING.has(s.id)) followQueue(s);
+      return;
+    }
     live.run_id = r.run_id;
     live.phase = 'running';
 
@@ -1024,8 +1093,9 @@ function attachStream(sessionId, runId) {
   const live = () => {
     const s = S.sessions.find((x) => x.id === sessionId)
       || S.sessions.find((x) => x.session_id === sessionId);
-    const m = s && s.messages[s.messages.length - 1];
-    return m && m.pending && m.run_id === runId ? { s, m } : null;
+    // By run id, not position: a queued bubble can sit after the live reply.
+    const m = s && s.messages.find((x) => x.pending && x.run_id === runId);
+    return m ? { s, m } : null;
   };
 
   const onEvent = (kind) => (ev) => {
@@ -1079,8 +1149,8 @@ async function pollRun(sessionId, runId) {
   if (!s) return;
 
   if (r.done) { finishRun(s, runId, r); return; }
-  const m = s.messages[s.messages.length - 1];
-  if (m && m.pending && m.run_id === runId && !m.text && r.status === 'running') {
+  const m = s.messages.find((x) => x.pending && x.run_id === runId);
+  if (m && !m.text && r.status === 'running') {
     m.phase = 'running';
     if (S.activeSession === s.id) renderThread();
   }
@@ -1098,8 +1168,9 @@ function finishRun(s, runId, r) {
   // released instead of waiting forever for an id that is not coming.
   if (!r.session_id && isUnresolved(s.id)) s.no_session = true;
 
-  const m = s.messages[s.messages.length - 1];
-  if (m && m.pending && m.run_id === runId) {
+  // Found by run id, not by position: queued messages sit after it.
+  const m = s.messages.find((x) => x.pending && x.run_id === runId);
+  if (m) {
     Object.assign(m, {
       pending: false,
       text: r.text || (r.error ? `The run ended as \`${r.status}\`: ${r.error}` : ''),
@@ -1124,6 +1195,7 @@ function finishRun(s, runId, r) {
   if (S.activeSession === s.id) renderThread();
   renderChannels(); renderTabs();
 
+  followQueue(s);
   if (r.status === 'success') toast(`${agentBy(s.agent)?.name ?? s.agent} replied · ${money(r.cost_usd)}`, 'ok');
   else toast(`Run ended as ${r.status}`, 'warn');
 
@@ -1849,6 +1921,8 @@ function wire() {
   $('#msgs').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-trace]');
     if (btn) showTrace(btn.dataset.trace, btn);
+    const cq = e.target.closest('[data-cancel-queue]');
+    if (cq) cancelQueued(cq.dataset.cancelQueue);
   });
 
   $('#threadPin').onclick = async () => {
